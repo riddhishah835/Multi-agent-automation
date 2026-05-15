@@ -29,6 +29,10 @@ from src.tools.registry import (
     _infer_category,
     registry,
 )
+from typing import List
+from src.tools.registry import registry, ToolMeta
+from src.tools.embedder import embed_text, embed_batch, cosine_similarity
+
 
 log = logging.getLogger(__name__)
 
@@ -136,3 +140,30 @@ def prune_for_agent(agent_role: str, task: str, tenant_id: str) -> List[ToolMeta
         [t.name for t in filtered],
     )
     return filtered
+
+
+
+MAX_TOOLS = 5
+
+
+def prune_tools(task_description: str, tenant_id: str, top_k: int = 3) -> List[ToolMeta]:
+    """
+    Return the top_k most semantically relevant tools for this task and tenant.
+    Now uses real sentence embeddings instead of bag-of-words.
+    Never returns more than MAX_TOOLS.
+    """
+    top_k = min(top_k, MAX_TOOLS)
+    candidates = registry.get_for_tenant(tenant_id)
+    if not candidates:
+        return []
+
+    task_vec = embed_text(task_description)
+    descriptions = [t.description for t in candidates]
+    tool_vecs = embed_batch(descriptions)
+
+    scored = [
+        (cosine_similarity(task_vec, vec), tool)
+        for tool, vec in zip(candidates, tool_vecs)
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [tool for _, tool in scored[:top_k]]
