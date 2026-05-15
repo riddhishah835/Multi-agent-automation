@@ -45,6 +45,17 @@ class AuditState(TypedDict):
     severity_breakdown: dict
 
     audit_completed_at: str
+    audit_confidence: float
+
+    document_classification: str
+    document_relevance: str
+    relevance_score: int
+
+    classification_confidence: float
+    classification_matches: dict
+
+    positive_findings: list
+    workflow_reason: str
 
 
 # =============================================================================
@@ -125,7 +136,6 @@ def load_tenant_rules(tenant_id: str) -> dict:
 # NODE A — INGESTION
 # =============================================================================
 
-
 async def node_ingestion(state: AuditState) -> AuditState:
     """
     Real PDF ingestion node.
@@ -149,6 +159,166 @@ async def node_ingestion(state: AuditState) -> AuditState:
         "raw_text": pdf_text[:5000],
         "document_type": "PDF"
     }
+
+    return state
+
+async def node_document_classification(state: AuditState) -> AuditState:
+    """
+    Semantic document routing layer.
+
+    Determines:
+    - document type
+    - business relevance
+    - audit eligibility
+    - workflow routing decision
+    """
+
+    state["current_node"] = "document_classification"
+
+    document_text = state["parsed_documents"].get("raw_text", "").lower()
+
+    # -------------------------------------------------------------------------
+    # DOCUMENT TYPE TAXONOMY
+    # -------------------------------------------------------------------------
+
+    document_categories = {
+        "COMPLIANCE_DOCUMENT": [
+            "soc2",
+            "iso27001",
+            "security policy",
+            "risk management",
+            "vendor security",
+            "compliance",
+            "audit controls",
+            "access control"
+        ],
+
+        "LEGAL_DOCUMENT": [
+            "agreement",
+            "contract",
+            "nda",
+            "terms",
+            "legal"
+        ],
+
+        "FINANCIAL_DOCUMENT": [
+            "invoice",
+            "balance sheet",
+            "financial statement",
+            "revenue",
+            "expense"
+        ],
+
+        "ACADEMIC_DOCUMENT": [
+            "hall ticket",
+            "semester",
+            "exam",
+            "course code",
+            "student id"
+        ]
+    }
+
+    # -------------------------------------------------------------------------
+    # CLASSIFICATION
+    # -------------------------------------------------------------------------
+
+    category_scores = {}
+
+    matched_keywords = {}
+
+    for category, keywords in document_categories.items():
+
+        score = 0
+
+        matches = []
+
+        for keyword in keywords:
+
+            if keyword.lower() in document_text:
+                score += 10
+                matches.append(keyword)
+
+        category_scores[category] = score
+        matched_keywords[category] = matches
+
+    # -------------------------------------------------------------------------
+    # BEST CATEGORY
+    # -------------------------------------------------------------------------
+
+    best_category = max(category_scores, key=category_scores.get)
+
+    best_score = category_scores[best_category]
+
+    confidence = min(best_score / 100, 1.0)
+
+    state["classification_confidence"] = round(confidence, 2)
+
+    state["document_classification"] = best_category
+    state["relevance_score"] = best_score
+    state["classification_matches"] = matched_keywords
+
+    # -------------------------------------------------------------------------
+    # ROUTING DECISION
+    # -------------------------------------------------------------------------
+
+    if best_category == "COMPLIANCE_DOCUMENT":
+
+        state["document_relevance"] = "RELEVANT"
+        state["workflow_reason"] = (
+            "Document contains compliance-related indicators"
+        )
+
+    elif best_category in [
+        "LEGAL_DOCUMENT",
+        "FINANCIAL_DOCUMENT"
+    ]:
+
+        state["document_relevance"] = "REVIEW"
+
+    else:
+
+        state["document_relevance"] = "IRRELEVANT"
+        state["workflow_reason"] = (
+            "Document classified as non-enterprise / non-compliance artifact"
+        )
+
+        state["status"] = "skipped"
+
+        state["draft_report"] = f"""
+# Compliance Audit Report
+
+## Document Routing Decision
+
+This uploaded document was classified as:
+
+{best_category}
+
+The system determined this document is not suitable
+for compliance auditing.
+
+## Relevance Score
+{score}/100
+
+## Classification Confidence
+{state["classification_confidence"]}
+
+## Routing Decision
+{state["document_relevance"]}
+
+## Matched Indicators
+
+{matched_keywords[best_category] if matched_keywords[best_category] else "None"}
+
+## Recommended Action
+
+## Workflow Reason
+{state["workflow_reason"]}
+
+SKIP AUDIT WORKFLOW
+
+## Status
+SKIPPED
+"""
 
     return state
 
@@ -185,62 +355,67 @@ async def node_adversarial_audit(state: AuditState) -> AuditState:
     state["current_node"] = "adversarial_audit"
 
     findings = []
+    positive_findings = []
 
-    document_text = state["parsed_documents"].get("raw_text", "")
+    document_text = state["parsed_documents"].get("raw_text", "").lower()
 
     rules = state["retrieved_rules"]["required_controls"]
 
-    coverage = {
-        "encryption": False,
-        "mfa": False,
-        "audit_logging": False
-    }
-
-    # -------------------------------------------------------------------------
-    # ENCRYPTION
-    # -------------------------------------------------------------------------
+    coverage = {}
 
     for control_name, control_config in rules.items():
 
         if not control_config["required"]:
             continue
 
-    keywords = control_config["keywords"]
+        keywords = control_config["keywords"]
 
-    found = any(
-        keyword.lower() in document_text.lower()
-        for keyword in keywords
-    )
+        matched_keywords = []
 
-    coverage[control_name] = found
+        for keyword in keywords:
+            if keyword.lower() in document_text:
+                matched_keywords.append(keyword)
 
-    matched_keyword = None
+        found = len(matched_keywords) > 0
 
-    for keyword in keywords:
-        if keyword.lower() in document_text.lower():
-            matched_keyword = keyword
-            break
-            
-    if not found:
+        coverage[control_name] = found
 
-        findings.append({
-            "severity": control_config["severity"],
-            "issue": f"{control_name.replace('_', ' ').title()} controls missing",
-            "status": "non_compliant",
-            "evidence": (
-                f"Detected keyword: {matched_keyword}"
-                if matched_keyword
-                else f"No {control_name.replace('_', ' ')} controls detected in document"
-            ),
-            "finding_id": f"F-{len(findings)+1:03}",
-            "page_reference": "Document-wide search",
-            "frameworks": state["retrieved_rules"]["compliance_frameworks"],
-            "control_description": control_config["description"],
-            "confidence": 0.92
-        })
+        # ---------------------------------------------------------------------
+        # POSITIVE FINDINGS
+        # ---------------------------------------------------------------------
+
+        if found:
+
+            positive_findings.append({
+                "control": control_name,
+                "matched_keywords": matched_keywords,
+                "status": "compliant"
+            })
+
+        # ---------------------------------------------------------------------
+        # NEGATIVE FINDINGS
+        # ---------------------------------------------------------------------
+
+        else:
+
+            findings.append({
+                "finding_id": f"F-{len(findings)+1:03}",
+                "severity": control_config["severity"],
+                "issue": f"{control_name.replace('_', ' ').title()} controls missing",
+                "status": "non_compliant",
+                "evidence": (
+                    f"No {control_name.replace('_', ' ')} controls detected in document"
+                ),
+                "page_reference": "Document-wide search",
+                "frameworks": state["retrieved_rules"]["compliance_frameworks"],
+                "control_description": control_config["description"],
+                "confidence": 0.92,
+                "matched_keywords": matched_keywords,
+            })
 
     state["control_coverage"] = coverage
     state["audit_findings"] = findings
+    state["positive_findings"] = positive_findings
 
     return state
 
@@ -267,6 +442,16 @@ async def node_gap_analysis(state: AuditState) -> AuditState:
         "LOW": 0
     }
 
+    average_confidence = 0
+
+    if state["audit_findings"]:
+        average_confidence = round(
+            sum(f["confidence"] for f in state["audit_findings"]) / len(state["audit_findings"]),
+            2
+        )
+
+    state["audit_confidence"] = average_confidence
+
     for finding in state["audit_findings"]:
 
         severity_breakdown[finding["severity"]] += 1
@@ -291,22 +476,25 @@ async def node_gap_analysis(state: AuditState) -> AuditState:
     state["risk_score"] = max(risk_score, 0)
 
     if state["risk_score"] >= 80:
-        state["risk_level"] = "LOW"
+        state["risk_level"] = "HIGH"
 
     elif state["risk_score"] >= 50:
         state["risk_level"] = "MEDIUM"
 
     else:
-        state["risk_level"] = "HIGH"
+        state["risk_level"] = "LOW"
 
-    if state["risk_level"] == "LOW":
-        state["approval_recommendation"] = "APPROVE"
+    if state["compliance_status"] == "NON_COMPLIANT":
+        state["approval_recommendation"] = "REJECT"
+
+    elif state["risk_level"] == "HIGH":
+        state["approval_recommendation"] = "REJECT"
 
     elif state["risk_level"] == "MEDIUM":
         state["approval_recommendation"] = "REVIEW"
 
     else:
-        state["approval_recommendation"] = "REJECT"
+        state["approval_recommendation"] = "APPROVE"
 
     coverage_values = list(state["control_coverage"].values())
 
@@ -376,7 +564,7 @@ Compliance Status: {state["compliance_status"]}
 
 ## Compliance Summary
 
-- Total Findings: {len(findings)}
+- Total Findings: {len(state["audit_findings"])}
 - Risk Score: {state["risk_score"]}/100
 - Risk Level: {state["risk_level"]}
 - Recommendation: {state["approval_recommendation"]}
@@ -396,8 +584,15 @@ Compliance Status: {state["compliance_status"]}
 
 {chr(10).join([
     f"- [{f['severity']}] {f['issue']}\n  Evidence: {f['evidence']}\n  Source Reference: {f['page_reference']} Frameworks: {', '.join(f['frameworks'])}"
-    for f in findings
+    for f in state["audit_findings"]
 ]) if findings else "No compliance issues detected."}
+
+## Positive Findings
+
+{chr(10).join([
+    f"- {f['control']} controls detected ({', '.join(f['matched_keywords'])})"
+    for f in state['positive_findings']
+]) if state['positive_findings'] else 'No compliant controls detected.'}
 
 ## Gap Analysis
 
@@ -414,6 +609,9 @@ Compliance Status: {state["compliance_status"]}
 - Run ID: {state["run_id"]}
 - Tenant: {state["tenant_id"]}
 - Audit Timestamp: {state["audit_completed_at"]}
+
+## Audit Confidence
+{state["audit_confidence"]}
 
 ## Status
 Audit completed successfully.
@@ -449,16 +647,20 @@ async def node_human_review_gate(state: AuditState) -> AuditState:
 
 
 async def resume_after_human_review(
+        
     state: AuditState,
     approved: bool
 ) -> AuditState:
     """
     Resume workflow after human decision.
     """
-
+    
     state["human_decision"] = "approved" if approved else "rejected"
 
     state["requires_human_review"] = False
+
+    if state["status"] == "skipped":
+        return state
 
     if approved:
         state["status"] = "completed"
@@ -484,6 +686,12 @@ async def run_audit(state: AuditState) -> AuditState:
 
     state = await node_ingestion(state)
     save_workflow_checkpoint(state)
+
+    state = await node_document_classification(state)
+    save_workflow_checkpoint(state)
+
+    if state["document_relevance"] != "RELEVANT":
+        return state
 
     state = await node_rule_retrieval(state)
     save_workflow_checkpoint(state)
@@ -588,7 +796,18 @@ if __name__ == "__main__":
 
         "severity_breakdown": {},
 
-        "audit_completed_at": ""
+        "audit_completed_at": "",
+        "audit_confidence": 0.0,
+
+        "document_classification": "UNKNOWN",
+        "document_relevance": "UNKNOWN",
+        "relevance_score": 0,
+
+        "classification_confidence": 0.0,
+        "classification_matches": {},
+
+        "positive_findings": [],
+        "workflow_reason": "",
     }
 
     final_state = asyncio.run(run_audit(initial_state))
