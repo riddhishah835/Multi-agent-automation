@@ -1,15 +1,15 @@
 # Core Framework & API
-fastapi==0.110.0
+fastapi>=0.110.0
 uvicorn==0.27.0
-pydantic==2.6.1
-pydantic-settings==2.1.0
+pydantic>=2.7.4
+pydantic-settings>=2.1.0
 
-# LLM & Agents - UPDATED FOR COMPATIBILITY
-langchain>=0.2.0
+# LLM & Agents - THE SYNCED STACK
+langchain>=0.3.0
 langchain-core>=0.3.36
 langchain-openai>=0.1.1
 langgraph>=0.2.0
-langchain-mcp-adapters==0.1.0
+langchain-mcp-adapters>=0.1.0
 
 # Database & Caching
 redis==5.0.1
@@ -18,20 +18,20 @@ psycopg2-binary==2.9.9
 
 # Vector & Semantic Search
 faiss-cpu==1.7.4
-qdrant-client==1.18.0
+qdrant-client>=1.10.0
 sentence-transformers==2.2.2
 numpy>=1.24.3
 
 # Async & Concurrency
 celery==5.3.4
-asyncio-contextmanager==1.0.1
+asyncio-contextmanager>=1.0.1
 tenacity==8.2.3
 
 # Security & Auth
 python-jose==3.3.0
 python-multipart==0.0.6
-pydantic[email]==2.6.1
-PyJWT==2.8.0
+pydantic[email]>=2.7.4
+PyJWT>=2.8.0
 
 # Monitoring & Logging
 python-json-logger==2.0.7
@@ -39,11 +39,11 @@ opentelemetry-api==1.21.0
 opentelemetry-sdk==1.21.0
 opentelemetry-instrumentation-fastapi==0.42b0
 
-# Utilities
+# Utilities - UPDATED TO FIX MCP CONFLICT
 python-dotenv==1.0.0
 pyyaml==6.0.1
 requests==2.31.0
-httpx==0.25.2
+httpx>=0.27.1
 dataclasses-json==0.6.1
 
 # Testing
