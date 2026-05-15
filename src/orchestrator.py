@@ -1,5 +1,7 @@
 import uuid
 from typing import TypedDict, Optional
+import json
+from pathlib import Path
 # from src.planner import plan_task
 # from src.executor import execute_plan
 # from src.memory.vector_store import store_memory, search_memory
@@ -25,6 +27,49 @@ class AuditState(TypedDict):
 
     requires_human_review: bool
     human_decision: Optional[str]
+
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+
+def save_workflow_checkpoint(state: AuditState):
+    """
+    Saves workflow state to disk after each node.
+    """
+
+    checkpoint_file = CHECKPOINT_DIR / f"{state['run_id']}.json"
+
+    with open(checkpoint_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+def load_workflow_checkpoint(run_id: str) -> AuditState:
+    """
+    Loads workflow state from disk.
+    """
+
+    checkpoint_file = CHECKPOINT_DIR / f"{run_id}.json"
+
+    with open(checkpoint_file, "r") as f:
+        state = json.load(f)
+
+    return state
+
+async def resume_audit(run_id: str) -> AuditState:
+    """
+    Resume workflow execution from saved checkpoint.
+    """
+
+    state = load_workflow_checkpoint(run_id)
+
+    if state["status"] == "awaiting_human_review":
+        print("\nResuming after human approval...\n")
+
+        state = await resume_after_human_review(
+            state,
+            approved=True
+        )
+
+    return state
 
 async def execute(run_id: str, payload: dict):
     task = payload.get("task")
@@ -233,6 +278,7 @@ async def resume_after_human_review(
     else:
         state["status"] = "rejected"
 
+    save_workflow_checkpoint(state)
     return state
 
 async def run_audit(state: AuditState) -> AuditState:
@@ -242,12 +288,17 @@ async def run_audit(state: AuditState) -> AuditState:
     """
 
     state = await node_ingestion(state)
-
+    save_workflow_checkpoint(state)
     state = await node_rule_retrieval(state)
+    save_workflow_checkpoint(state)
     state = await node_adversarial_audit(state)
+    save_workflow_checkpoint(state)
     state = await node_gap_analysis(state)
+    save_workflow_checkpoint(state)
     state = await node_report_generation(state)
+    save_workflow_checkpoint(state)
     state = await node_human_review_gate(state)
+    save_workflow_checkpoint(state)
 
     return state
 
@@ -299,3 +350,15 @@ if __name__ == "__main__":
 
     print("\n=== FINAL AUDIT STATE ===\n")
     print_workflow_summary(final_state)
+    loaded_state = load_workflow_checkpoint("audit-001")
+
+    print("\n=== LOADED CHECKPOINT ===\n")
+    print(loaded_state["status"])
+    print(loaded_state["current_node"])
+    resumed_state = asyncio.run(
+        resume_audit("audit-001")
+    )
+
+    print("\n=== RESUMED WORKFLOW ===\n")
+    print(resumed_state["status"])
+    print(resumed_state["human_decision"])
