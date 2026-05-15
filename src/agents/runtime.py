@@ -14,12 +14,12 @@ Agent roles
   the_judge   → Adversarially scans evidence for non-compliance  → List[Finding]
   the_scribe  → Drafts a professional consulting report           → Markdown string
 
-Each agent is backed by the Anthropic Claude API (claude-sonnet-4-20250514).
+Each agent is backed by the Google Gemini API (gemini-2.0-flash).
 Tool calls are routed through mcp_bridge.call_tool() so every invocation
 is captured in the audit trail.
 
 Environment variables expected:
-  ANTHROPIC_API_KEY
+  GEMINI_API_KEY
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-import anthropic  # pip install anthropic
+import os
+import google.generativeai as genai  # pip install google-generativeai
 
 from src.agents.schemas import AgentResult, AuditState, EvidenceCard, Finding
 from src.tools.mcp_bridge import call_tool
@@ -39,19 +40,26 @@ from src.tools.registry import ToolMeta
 
 log = logging.getLogger(__name__)
 
-# ── Anthropic client (module-level singleton) ─────────────────────────────────
+# ── Gemini client (module-level singleton) ────────────────────────────────────
 
-_client: anthropic.Anthropic | None = None
-
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from env
-    return _client
+_model: genai.GenerativeModel | None = None
 
 
-MODEL = "claude-sonnet-4-20250514"
+def _get_client() -> genai.GenerativeModel:
+    global _model
+    if _model is None:
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        _model = genai.GenerativeModel(
+            model_name=MODEL,
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=MAX_TOKENS,
+                temperature=0.2,       # low temp = deterministic, good for audits
+            ),
+        )
+    return _model
+
+
+MODEL = "gemini-2.0-flash"
 MAX_TOKENS = 4096
 
 
@@ -183,9 +191,9 @@ def _run_agent(
     """
     Core agentic loop:
       1. Prune tools for this role + task.
-      2. Call Claude with system prompt + context + available tools.
-      3. If Claude requests a tool, dispatch via mcp_bridge and feed result back.
-      4. Repeat until Claude returns a final text response (no more tool calls).
+      2. Call Gemini with system prompt + context + available tools.
+      3. If Gemini requests a tool, dispatch via mcp_bridge and feed result back.
+      4. Repeat until Gemini returns a final text response (no more tool calls).
       5. Parse the final text into a typed output and wrap in AgentResult.
     """
     start_ms = time.time()
@@ -193,85 +201,97 @@ def _run_agent(
 
     # Step 1 — prune tools
     available_tools = prune_for_agent(agent_role, task, tenant_id)
-    tool_schemas = [_to_claude_tool_schema(t) for t in available_tools]
+    tool_declarations = [_to_gemini_tool_declaration(t) for t in available_tools]
 
-    # Step 2 — build initial message
+    # Step 2 — build conversation history
     user_message = _build_user_message(task, context)
-    messages = [{"role": "user", "content": user_message}]
 
-    client = _get_client()
+    # Gemini uses a chat session for multi-turn tool calls
+    model = _get_client()
+
+    # Rebuild model with system instruction + tools for this specific agent call
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    agent_model = genai.GenerativeModel(
+        model_name=MODEL,
+        system_instruction=system_prompt,
+        tools=tool_declarations if tool_declarations else None,
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=MAX_TOKENS,
+            temperature=0.2,
+        ),
+    )
+    chat = agent_model.start_chat()
     final_text: str = ""
 
     try:
         for round_num in range(max_tool_rounds + 1):
             log.info(
                 "runtime[%s]: API call round=%d tools_available=%d",
-                agent_role, round_num, len(tool_schemas),
+                agent_role, round_num, len(tool_declarations),
             )
 
-            kwargs: Dict[str, Any] = {
-                "model": MODEL,
-                "max_tokens": MAX_TOKENS,
-                "system": system_prompt,
-                "messages": messages,
-            }
-            if tool_schemas:
-                kwargs["tools"] = tool_schemas
+            if round_num == 0:
+                response = chat.send_message(user_message)
+            # (subsequent rounds are handled inside the tool loop below)
 
-            response = client.messages.create(**kwargs)
+            # Extract text parts
+            text_parts = [
+                part.text
+                for candidate in response.candidates
+                for part in candidate.content.parts
+                if hasattr(part, "text") and part.text
+            ]
+            if text_parts:
+                final_text = "\n".join(text_parts)
 
-            # Collect all text blocks as final_text (may be overwritten each round)
-            text_blocks = [b.text for b in response.content if b.type == "text"]
-            final_text = "\n".join(text_blocks)
+            # Check for tool calls
+            tool_call_parts = [
+                part
+                for candidate in response.candidates
+                for part in candidate.content.parts
+                if hasattr(part, "function_call") and part.function_call.name
+            ]
 
-            # Check stop reason
-            if response.stop_reason == "end_turn":
-                log.info("runtime[%s]: agent finished (end_turn)", agent_role)
+            if not tool_call_parts:
+                log.info("runtime[%s]: agent finished (no tool calls)", agent_role)
                 break
 
-            if response.stop_reason != "tool_use":
-                log.warning(
-                    "runtime[%s]: unexpected stop_reason=%r",
-                    agent_role, response.stop_reason,
-                )
+            if round_num == max_tool_rounds:
+                log.warning("runtime[%s]: hit max_tool_rounds=%d", agent_role, max_tool_rounds)
                 break
 
-            # Step 3 — handle tool calls
-            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-            if not tool_use_blocks:
-                break
-
-            # Append assistant turn (required for multi-turn)
-            messages.append({"role": "assistant", "content": response.content})
-
-            # Execute each tool and collect results
-            tool_results = []
-            for tb in tool_use_blocks:
-                tool_name = tb.name
-                tool_input = tb.input
+            # Step 3 — execute tool calls and feed results back
+            tool_responses = []
+            for part in tool_call_parts:
+                fc = part.function_call
+                tool_name = fc.name
+                tool_input = dict(fc.args)
                 tools_used.append(tool_name)
 
                 log.info("runtime[%s]: tool_call name=%r", agent_role, tool_name)
                 try:
                     result = call_tool(tool_name, tool_input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tb.id,
-                        "content": json.dumps(result, default=str),
-                    })
-                except Exception as exc:
-                    log.error(
-                        "runtime[%s]: tool %r failed: %s", agent_role, tool_name, exc
+                    tool_responses.append(
+                        genai.protos.Part(
+                            function_response=genai.protos.FunctionResponse(
+                                name=tool_name,
+                                response={"result": json.dumps(result, default=str)},
+                            )
+                        )
                     )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tb.id,
-                        "content": json.dumps({"error": str(exc)}),
-                        "is_error": True,
-                    })
+                except Exception as exc:
+                    log.error("runtime[%s]: tool %r failed: %s", agent_role, tool_name, exc)
+                    tool_responses.append(
+                        genai.protos.Part(
+                            function_response=genai.protos.FunctionResponse(
+                                name=tool_name,
+                                response={"error": str(exc)},
+                            )
+                        )
+                    )
 
-            # Feed tool results back for next round
-            messages.append({"role": "user", "content": tool_results})
+            # Send all tool results back in one turn
+            response = chat.send_message(tool_responses)
 
         # Step 5 — parse output
         output = output_parser(final_text)
@@ -281,7 +301,7 @@ def _run_agent(
             agent_name=f"the_{agent_role}",
             status="success",
             output=output,
-            tools_used=list(dict.fromkeys(tools_used)),  # deduplicated, order preserved
+            tools_used=list(dict.fromkeys(tools_used)),
             duration_ms=round(duration_ms, 2),
         )
 
@@ -359,26 +379,35 @@ def _parse_scribe_output(raw_text: str) -> Dict[str, Any]:
 # Tool schema conversion
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _to_claude_tool_schema(tool: ToolMeta) -> Dict[str, Any]:
+def _to_gemini_tool_declaration(tool: ToolMeta) -> genai.protos.Tool:
     """
-    Convert a ToolMeta (from registry.py) into the Anthropic tool_use schema.
+    Convert a ToolMeta (from registry.py) into a Gemini FunctionDeclaration tool.
     """
-    # Build a minimal JSON Schema from the string-typed input_schema dict
-    properties = {
-        k: {"type": v, "description": k}
-        for k, v in tool.input_schema.items()
-    }
-    required = list(tool.input_schema.keys())
+    properties = {}
+    for param_name, param_type in tool.input_schema.items():
+        # Map simple string type hints to Gemini's TYPE enum
+        type_map = {
+            "string": genai.protos.Type.STRING,
+            "str":    genai.protos.Type.STRING,
+            "int":    genai.protos.Type.INTEGER,
+            "integer":genai.protos.Type.INTEGER,
+            "float":  genai.protos.Type.NUMBER,
+            "bool":   genai.protos.Type.BOOLEAN,
+            "boolean":genai.protos.Type.BOOLEAN,
+        }
+        gemini_type = type_map.get(param_type.lower(), genai.protos.Type.STRING)
+        properties[param_name] = genai.protos.Schema(type=gemini_type)
 
-    return {
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-        },
-    }
+    fn = genai.protos.FunctionDeclaration(
+        name=tool.name,
+        description=tool.description,
+        parameters=genai.protos.Schema(
+            type=genai.protos.Type.OBJECT,
+            properties=properties,
+            required=list(tool.input_schema.keys()),
+        ),
+    )
+    return genai.protos.Tool(function_declarations=[fn])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
