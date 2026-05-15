@@ -58,3 +58,43 @@ async def execute(run_id: str, payload: dict):
         "result": result,
         "previous_context": previous_context
     }
+
+async def node_ingestion(state: AuditState) -> AuditState:
+    """
+    Simulates document ingestion/parsing.
+    Later this will call OCR/document tools.
+    """
+
+    state["current_node"] = "ingestion"
+    state["status"] = "processing"
+
+    # Temporary mock parsing
+    state["parsed_documents"] = {
+        "vendor_name": "Acme Corp",
+        "document_type": "SOC2",
+        "controls_found": [
+            "Encryption at Rest",
+            "MFA Enabled",
+            "Access Logging"
+        ]
+    }
+
+    return state
+
+async def node_rule_retrieval(state: AuditState) -> AuditState:
+    """
+    Simulates retrieval of compliance rules
+    for a specific tenant/client.
+    """
+
+    state["current_node"] = "rule_retrieval"
+
+    # Temporary mock rules
+    state["retrieved_rules"] = {
+        "encryption_required": True,
+        "mfa_required": True,
+        "soc2_required": True,
+        "audit_log_retention_days": 90
+    }
+
+    return state
