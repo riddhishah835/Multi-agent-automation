@@ -1,4 +1,5 @@
 import uuid
+import fitz
 from typing import TypedDict, Optional
 import json
 from pathlib import Path
@@ -71,6 +72,23 @@ async def resume_audit(run_id: str) -> AuditState:
 
     return state
 
+def extract_pdf_text(pdf_path: str) -> str:
+    """
+    Extracts raw text from PDF using PyMuPDF.
+    """
+
+    document = fitz.open(pdf_path)
+
+    full_text = ""
+
+    for page in document:
+        page_text = page.get_text()
+
+        full_text += f"\n--- PAGE {page.number + 1} ---\n"
+        full_text += page_text
+
+    return full_text
+
 async def execute(run_id: str, payload: dict):
     task = payload.get("task")
 
@@ -133,15 +151,20 @@ async def node_ingestion(state: AuditState) -> AuditState:
     state["current_node"] = "ingestion"
     state["status"] = "processing"
 
-    # Temporary mock parsing
+    pdf_text = extract_pdf_text(state["uploaded_files"][0])
+
+    vendor_name = "Unknown Vendor"
+
+    if "Acme" in pdf_text:
+        vendor_name = "Acme Corp"
+
+    if "BITS" in pdf_text:
+        vendor_name = "BITS Pilani"
+
     state["parsed_documents"] = {
-        "vendor_name": "Acme Corp",
-        "document_type": "SOC2",
-        "controls_found": [
-            "Encryption at Rest",
-            "MFA Enabled",
-            "Access Logging"
-        ]
+        "vendor_name": vendor_name,
+        "raw_text": pdf_text[:5000],  # limit size for now
+        "document_type": "PDF"
     }
 
     return state
@@ -174,20 +197,24 @@ async def node_adversarial_audit(state: AuditState) -> AuditState:
 
     findings = []
 
-    controls = state["parsed_documents"].get("controls_found", [])
+    document_text = state["parsed_documents"].get("raw_text", "")
 
-    if "Encryption at Rest" not in controls:
+    if "encryption" not in document_text.lower():
         findings.append({
             "severity": "HIGH",
             "issue": "Missing encryption at rest",
-            "status": "non_compliant"
+            "status": "non_compliant",
+            "evidence": "No encryption-related controls detected in document",
+            "page_reference": "Document-wide search"
         })
 
-    if "MFA Enabled" not in controls:
+    if "mfa" not in document_text.lower():
         findings.append({
             "severity": "MEDIUM",
             "issue": "MFA not enabled",
-            "status": "non_compliant"
+            "status": "non_compliant",
+            "evidence": "No MFA-related controls detected in document",
+            "page_reference": "Document-wide search"
         })
 
     state["audit_findings"] = findings
@@ -235,10 +262,16 @@ async def node_report_generation(state: AuditState) -> AuditState:
 {state["parsed_documents"].get("document_type")}
 
 ## Findings
-Total Findings: {len(findings)}
+{chr(10).join([
+    f"- [{f['severity']}] {f['issue']}\n  Evidence: {f['evidence']} Source: {f['page_reference']}"
+    for f in findings
+]) if findings else "No compliance issues detected."}
 
 ## Gap Analysis
-Total Gaps: {len(gaps)}
+{chr(10).join([
+    f"- {g['risk']} → {g['recommended_fix']}"
+    for g in gaps
+]) if gaps else "No remediation required."}
 
 ## Status
 Audit completed successfully.
@@ -362,3 +395,7 @@ if __name__ == "__main__":
     print("\n=== RESUMED WORKFLOW ===\n")
     print(resumed_state["status"])
     print(resumed_state["human_decision"])
+    pdf_text = extract_pdf_text("sample_soc2.pdf")
+
+    print("\n=== PDF TEXT PREVIEW ===\n")
+    print(pdf_text[:1000])
