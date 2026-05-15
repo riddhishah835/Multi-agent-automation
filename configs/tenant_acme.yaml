@@ -1,3 +1,9 @@
+tenant_id: acme
+
+compliance_frameworks:
+  - SOC2
+  - ISO27001
+
 required_controls:
   encryption:
     required: true
