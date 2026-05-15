@@ -1,578 +1,636 @@
 """
-API Gateway for Agentic OS
-Handles: Task submission, status tracking, approval requests, health checks
+Agentic OS Gateway - API Layer
+Handles request routing, authentication, and task execution
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import uuid
+from typing import Dict, Any, Optional, List
 import logging
+import asyncio
+import uuid
 from datetime import datetime
 import json
+from enum import Enum
 
-# Import internal modules (will be available after P1, P2, P3 complete)
-from src.config_loader import ConfigLoader, get_tenant_config
-from src.observability import ObservabilityTracker, log_trace
+# Import our modules
+from src.config_loader import ConfigLoader, get_tenant_config, get_config_loader
+from src.observability import ObservabilityTracker
 from src.memory.state import StateManager
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# PYDANTIC SCHEMAS FOR REQUEST/RESPONSE
+# Initialize Core Components
 # ============================================================================
 
-class TaskSubmission(BaseModel):
-    """Input schema for task submission"""
-    task: str  # User's natural language request
-    workflow_id: Optional[str] = "default"
-    metadata: Optional[Dict[str, Any]] = None
+config_loader = get_config_loader("configs")
+observability = ObservabilityTracker("agentic_os")
+state_manager = StateManager("checkpoints")
 
-
-class TaskStatusResponse(BaseModel):
-    """Response schema for task status"""
-    run_id: str
-    status: str  # "submitted", "processing", "awaiting_approval", "completed", "failed"
-    progress: Optional[str] = None
-    current_node: Optional[str] = None
-    requires_approval: bool = False
-    approval_url: Optional[str] = None
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class ApprovalRequest(BaseModel):
-    """Request schema for approval endpoint"""
-    approved: bool
-    reason: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class ApprovalResponse(BaseModel):
-    """Response schema for approval"""
-    run_id: str
-    status: str
-    message: str
-    approved_at: datetime
-
-
-class HealthCheckResponse(BaseModel):
-    """Response schema for health check"""
-    status: str  # "healthy", "degraded", "unhealthy"
-    timestamp: datetime
-    components: Dict[str, str]
-    version: str = "1.0.0"
-
-
-# ============================================================================
-# DEPENDENCY INJECTION & AUTH
-# ============================================================================
-
-def get_tenant_id_from_token(authorization: str = Header(None)) -> str:
-    """
-    Extract tenant_id from JWT token in Authorization header.
-    Format: "Bearer <jwt_token>"
-    
-    For demo purposes, we'll accept a simple "Bearer tenant_acme" format.
-    In production, decode the JWT properly.
-    """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-    
-    try:
-        parts = authorization.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer":
-            raise ValueError("Invalid authorization header format")
-        
-        token = parts[1]
-        
-        # DEMO MODE: For development, extract tenant from token directly
-        # In production, use PyJWT to decode and validate signature
-        if token.startswith("tenant_"):
-            tenant_id = token.split("_")[1].split("_")[0]  # Extract "acme" from "tenant_acme_v1"
-            return tenant_id
-        
-        # Fallback: Extract from token claims (production approach)
-        # from jose import jwt
-        # claims = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        # return claims.get("tenant_id")
-        
-        raise ValueError("Could not extract tenant_id from token")
-    
-    except Exception as e:
-        logger.error(f"Auth error: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-# ============================================================================
-# FASTAPI APP INITIALIZATION
-# ============================================================================
-
+# Create FastAPI app
 app = FastAPI(
     title="Agentic OS Gateway",
-    description="Multi-tenant orchestration platform for AI agents",
+    description="API Gateway for Multi-Tenant Agentic OS",
     version="1.0.0"
 )
 
-# Add CORS middleware for cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to specific domains
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================================
+# Request/Response Models
+# ============================================================================
 
-# Initialize core services
-config_loader = ConfigLoader()
-observability = ObservabilityTracker()
-state_manager = StateManager()
+class TaskStatus(str, Enum):
+    """Task status enumeration"""
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    APPROVED = "approved"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-# In-memory task store (for demo; replace with database in production)
-tasks_store: Dict[str, Dict[str, Any]] = {}
+
+class SubmitTaskRequest(BaseModel):
+    """Request model for task submission"""
+    task: str
+    workflow_id: str = "default"
+    priority: int = 1
+    metadata: Dict[str, Any] = {}
+
+
+class TaskStatusResponse(BaseModel):
+    """Response model for task status"""
+    run_id: str
+    status: TaskStatus
+    progress: float
+    message: str
+    needs_approval: bool = False
+    result: Optional[Dict[str, Any]] = None
+
+
+class ApprovalRequest(BaseModel):
+    """Request model for approval"""
+    approved: bool
+    reason: Optional[str] = None
+    approver_id: str = "system"
+
+
+class HealthCheckResponse(BaseModel):
+    """Response model for health check"""
+    status: str
+    timestamp: str
+    components: Dict[str, str]
+    version: str
 
 
 # ============================================================================
-# ENDPOINT 1: HEALTH CHECK
+# Authentication & Validation
 # ============================================================================
 
-@app.get("/health", response_model=HealthCheckResponse)
-async def health_check():
+def extract_tenant_id(authorization: Optional[str] = Header(None)) -> str:
     """
-    Check system health and component status.
-    Called by load balancers and monitoring systems.
-    """
-    try:
-        # Check each component's availability
-        components = {
-            "api": "healthy",
-            "orchestrator": "healthy",  # Will be checked against P1
-            "redis_cache": "degraded",  # Check Redis connection
-            "vector_db": "degraded",    # Check FAISS/Qdrant
-            "config_loader": "healthy"
-        }
-        
-        # Try to connect to Redis (basic check)
-        try:
-            import redis
-            r = redis.Redis(host='localhost', port=6379, socket_connect_timeout=2)
-            r.ping()
-            components["redis_cache"] = "healthy"
-        except Exception as e:
-            logger.warning(f"Redis health check failed: {str(e)}")
-        
-        # Overall status
-        if all(v == "healthy" for v in components.values()):
-            status = "healthy"
-        elif any(v == "healthy" for v in components.values()):
-            status = "degraded"
-        else:
-            status = "unhealthy"
-        
-        return HealthCheckResponse(
-            status=status,
-            timestamp=datetime.now(),
-            components=components
-        )
+    Extract tenant ID from Authorization header
+    Format: "Bearer tenant_<tenant_id>"
     
-    except Exception as e:
-        logger.error(f"Health check error: {str(e)}")
-        return HealthCheckResponse(
-            status="unhealthy",
-            timestamp=datetime.now(),
-            components={"error": str(e)}
-        )
+    Args:
+        authorization: Authorization header value
+        
+    Returns:
+        Tenant ID
+        
+    Raises:
+        HTTPException: If authorization is invalid
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Simple token parsing: Bearer tenant_<tenant_id>
+    if not token.startswith("tenant_"):
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    
+    tenant_id = token.replace("tenant_", "")
+    
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="Missing tenant ID")
+    
+    return tenant_id
+
+
+def validate_tenant(tenant_id: str) -> bool:
+    """
+    Validate that tenant exists and is authorized
+    
+    Args:
+        tenant_id: The tenant ID to validate
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    return config_loader.validate_tenant(tenant_id)
 
 
 # ============================================================================
-# ENDPOINT 2: SUBMIT TASK
+# API Endpoints
 # ============================================================================
 
-@app.post("/submit", response_model=TaskStatusResponse)
+@app.post("/submit", response_model=Dict[str, Any])
 async def submit_task(
-    submission: TaskSubmission,
-    tenant_id: str = Depends(get_tenant_id_from_token),
-    background_tasks: BackgroundTasks = None
-):
+    request: SubmitTaskRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
     """
-    Submit a new task for processing.
+    Submit a new task for execution
     
-    Flow:
-    1. Extract tenant_id from auth token
-    2. Load tenant-specific configuration
-    3. Validate task against tenant's allowed workflows
-    4. Create run_id and initial state
-    5. Queue task for async orchestration (via P1)
-    6. Return task ID for polling
+    Request Format:
+    ```
+    POST /submit
+    Authorization: Bearer tenant_acme_v1
+    Content-Type: application/json
+    
+    {
+        "task": "Find top 5 AI companies",
+        "workflow_id": "default",
+        "priority": 1,
+        "metadata": {"source": "dashboard"}
+    }
+    ```
+    
+    Returns:
+    ```json
+    {
+        "run_id": "run_abc123xyz",
+        "status": "pending",
+        "message": "Task submitted successfully",
+        "workflow_id": "default"
+    }
+    ```
     """
+    trace_id = str(uuid.uuid4())
+    logger.info(f"[{trace_id}] Submit task request received")
+    
     try:
-        # Generate unique run ID
-        run_id = str(uuid.uuid4())
+        # Extract and validate tenant
+        tenant_id = extract_tenant_id(authorization)
         
-        # Load tenant configuration
-        tenant_config = config_loader.load_tenant_config(tenant_id)
-        if not tenant_config:
-            raise HTTPException(status_code=403, detail=f"Tenant '{tenant_id}' not found")
+        if not validate_tenant(tenant_id):
+            logger.warning(f"[{trace_id}] Invalid tenant: {tenant_id}")
+            raise HTTPException(status_code=403, detail="Invalid tenant")
         
-        # Validate workflow is enabled for this tenant
-        if submission.workflow_id not in tenant_config.get("enabled_workflows", ["default"]):
-            raise HTTPException(
-                status_code=403,
-                detail=f"Workflow '{submission.workflow_id}' not enabled for tenant '{tenant_id}'"
-            )
+        # Validate request
+        if not request.task or len(request.task.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Task cannot be empty")
+        
+        # Generate run ID
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
         
         # Create initial state
         initial_state = {
             "run_id": run_id,
             "tenant_id": tenant_id,
-            "original_request": submission.task,
-            "workflow_id": submission.workflow_id,
-            "metadata": submission.metadata or {},
-            "tenant_config": tenant_config,
-            "current_plan": [],
-            "gathered_context": "",
-            "final_output": "",
-            "requires_human_approval": False,
-            "status": "submitted",
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
+            "task": request.task,
+            "workflow_id": request.workflow_id,
+            "status": "pending",
+            "priority": request.priority,
+            "metadata": request.metadata,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "progress": 0.0,
+            "trace_id": trace_id
         }
         
-        # Store task in memory (will be replaced with database)
-        tasks_store[run_id] = initial_state
+        # Save initial state
+        state_manager.save_checkpoint(run_id, "gateway", initial_state)
         
-        # Log submission event
-        observability.log_event(
-            run_id=run_id,
-            tenant_id=tenant_id,
-            event_type="task_submitted",
-            details={
-                "task": submission.task,
-                "workflow_id": submission.workflow_id
-            }
-        )
+        # Start observability tracking
+        # observability.start_trace(trace_id, {
+        #     "run_id": run_id,
+        #     "tenant_id": tenant_id,
+        #     "task_type": "task_submission"
+        # })
         
-        # Queue async execution via background task (P1 integration)
-        if background_tasks:
-            background_tasks.add_task(
-                execute_task_async,
-                run_id=run_id,
-                initial_state=initial_state
-            )
+        # Queue async execution (you'll connect this to P1's orchestrator)
+        # For now, we just update status to running
+        background_tasks.add_task(execute_task_async, run_id, initial_state, trace_id)
         
-        logger.info(f"Task {run_id} submitted by tenant {tenant_id}")
+        logger.info(f"[{trace_id}] Task submitted successfully: {run_id}")
         
-        return TaskStatusResponse(
-            run_id=run_id,
-            status="submitted",
-            progress="Queued for processing",
-            current_node="orchestrator",
-            requires_approval=False,
-            created_at=initial_state["created_at"],
-            updated_at=initial_state["updated_at"]
-        )
+        return {
+            "run_id": run_id,
+            "status": "pending",
+            "message": "Task submitted successfully",
+            "workflow_id": request.workflow_id,
+            "tenant_id": tenant_id
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Task submission error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Submission failed: {str(e)}")
+        logger.error(f"[{trace_id}] Error submitting task: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-
-# ============================================================================
-# ENDPOINT 3: GET TASK STATUS
-# ============================================================================
 
 @app.get("/status/{run_id}", response_model=TaskStatusResponse)
-async def get_task_status(
+async def get_status(
     run_id: str,
-    tenant_id: str = Depends(get_tenant_id_from_token)
-):
+    authorization: Optional[str] = Header(None)
+) -> TaskStatusResponse:
     """
-    Poll task status by run_id.
+    Get the status of a submitted task
+    
+    Request Format:
+    ```
+    GET /status/run_abc123xyz
+    Authorization: Bearer tenant_acme_v1
+    ```
     
     Returns:
-    - Current status (submitted, processing, awaiting_approval, completed, failed)
-    - Progress indicator
-    - Approval URL if HITL is triggered
-    - Final result when complete
+    ```json
+    {
+        "run_id": "run_abc123xyz",
+        "status": "running",
+        "progress": 45.5,
+        "message": "Processing task...",
+        "needs_approval": false,
+        "result": null
+    }
+    ```
     """
+    trace_id = str(uuid.uuid4())
+    logger.info(f"[{trace_id}] Status check for run: {run_id}")
+    
     try:
-        # Retrieve task from store
-        task = tasks_store.get(run_id)
-        if not task:
-            raise HTTPException(status_code=404, detail=f"Task {run_id} not found")
+        # Extract and validate tenant
+        tenant_id = extract_tenant_id(authorization)
+        
+        # Load state
+        checkpoint = state_manager.load_checkpoint(run_id)
+        state = checkpoint["state"] if checkpoint else None
+        
+        if not state:
+            logger.warning(f"[{trace_id}] Run not found: {run_id}")
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         
         # Verify tenant ownership
-        if task["tenant_id"] != tenant_id:
+        if state.get("tenant_id") != tenant_id:
+            logger.warning(f"[{trace_id}] Tenant mismatch for run: {run_id}")
             raise HTTPException(status_code=403, detail="Unauthorized")
         
-        # Build response
-        approval_url = None
-        if task.get("requires_human_approval"):
-            approval_url = f"/approve/{run_id}"
-        
-        return TaskStatusResponse(
+        # Create response
+        response = TaskStatusResponse(
             run_id=run_id,
-            status=task.get("status", "processing"),
-            progress=task.get("progress", None),
-            current_node=task.get("current_node", None),
-            requires_approval=task.get("requires_human_approval", False),
-            approval_url=approval_url,
-            result=task.get("final_output", None),
-            error=task.get("error", None),
-            created_at=task.get("created_at"),
-            updated_at=task.get("updated_at")
+            status=TaskStatus(state.get("status", "pending")),
+            progress=state.get("progress", 0.0),
+            message=state.get("message", ""),
+            needs_approval=state.get("needs_approval", False),
+            result=state.get("result")
         )
+        
+        logger.info(f"[{trace_id}] Status returned: {response.status}")
+        return response
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Status check error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[{trace_id}] Error getting status: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-# ============================================================================
-# ENDPOINT 4: APPROVE TASK (HITL)
-# ============================================================================
-
-@app.post("/approve/{run_id}", response_model=ApprovalResponse)
+@app.post("/approve/{run_id}", response_model=Dict[str, Any])
 async def approve_task(
     run_id: str,
     approval: ApprovalRequest,
-    tenant_id: str = Depends(get_tenant_id_from_token),
-    background_tasks: BackgroundTasks = None
-):
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
     """
-    Approve or reject a task waiting for human approval (HITL).
+    Approve or reject a task waiting for approval
     
-    This endpoint is called by the Admin Dashboard when a high-risk action
-    (e.g., "Refund Customer", "Update Database") requires approval.
+    Request Format:
+    ```
+    POST /approve/run_abc123xyz
+    Authorization: Bearer tenant_acme_v1
+    Content-Type: application/json
     
-    Flow:
-    1. Verify task exists and is in "awaiting_approval" status
-    2. Verify tenant ownership
-    3. Update approval status
-    4. Resume LangGraph execution via state_manager.resume_workflow()
+    {
+        "approved": true,
+        "reason": "Looks good",
+        "approver_id": "user_123"
+    }
+    ```
+    
+    Returns:
+    ```json
+    {
+        "run_id": "run_abc123xyz",
+        "status": "approved",
+        "message": "Task approved and resumed"
+    }
+    ```
     """
+    trace_id = str(uuid.uuid4())
+    logger.info(f"[{trace_id}] Approval request for run: {run_id}")
+    
     try:
-        # Retrieve task
-        task = tasks_store.get(run_id)
-        if not task:
-            raise HTTPException(status_code=404, detail=f"Task {run_id} not found")
+        # Extract and validate tenant
+        tenant_id = extract_tenant_id(authorization)
+        
+        # Load state
+        checkpoint = state_manager.load_checkpoint(run_id,"gateway")
+        state = checkpoint["state"] if checkpoint else None
+        
+        if not state:
+            logger.warning(f"[{trace_id}] Run not found: {run_id}")
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         
         # Verify tenant ownership
-        if task["tenant_id"] != tenant_id:
+        if state.get("tenant_id") != tenant_id:
+            logger.warning(f"[{trace_id}] Tenant mismatch for run: {run_id}")
             raise HTTPException(status_code=403, detail="Unauthorized")
         
-        # Verify task is awaiting approval
-        if task.get("status") != "awaiting_approval":
+        # Verify task is waiting for approval
+        if state.get("status") != "waiting_approval":
             raise HTTPException(
                 status_code=400,
-                detail=f"Task is in '{task.get('status')}' status, not awaiting approval"
+                detail=f"Task is not waiting for approval (current status: {state.get('status')})"
             )
         
-        # Update approval status
-        approval_timestamp = datetime.now()
-        task["approval_status"] = "approved" if approval.approved else "rejected"
-        task["approval_reason"] = approval.reason
-        task["approval_notes"] = approval.notes
-        task["approved_at"] = approval_timestamp.isoformat()
-        task["updated_at"] = approval_timestamp.isoformat()
+        # Update state with approval
+        state["approval"] = {
+            "approved": approval.approved,
+            "reason": approval.reason,
+            "approver_id": approval.approver_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
         
-        # Log approval event
-        observability.log_event(
-            run_id=run_id,
-            tenant_id=tenant_id,
-            event_type="approval_decision",
-            details={
-                "approved": approval.approved,
-                "reason": approval.reason,
-                "notes": approval.notes
-            }
-        )
-        
+        # Update status based on approval
         if approval.approved:
-            # Resume workflow execution via state_manager
-            # This will be integrated with P3 (state_manager.resume_workflow())
-            task["status"] = "processing"
-            task["progress"] = "Resumed after approval"
-            
-            # Queue resumption in background
-            if background_tasks:
-                background_tasks.add_task(
-                    resume_workflow_after_approval,
-                    run_id=run_id,
-                    task_state=task
-                )
-            
-            message = "Task approved and resuming execution"
+            state["status"] = "approved"
+            state["message"] = "Task approved and resumed"
+            # Queue resumption (you'll connect this to P1's orchestrator)
+            background_tasks.add_task(resume_task_async, run_id, state, trace_id)
         else:
-            task["status"] = "rejected"
-            task["progress"] = f"Rejected: {approval.reason}"
-            message = "Task rejected"
+            state["status"] = "failed"
+            state["message"] = f"Task rejected: {approval.reason}"
         
-        logger.info(f"Task {run_id} {task['approval_status']} by tenant {tenant_id}")
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
         
-        return ApprovalResponse(
-            run_id=run_id,
-            status=task["status"],
-            message=message,
-            approved_at=approval_timestamp
-        )
+        logger.info(f"[{trace_id}] Approval processed: {approval.approved}")
+        
+        return {
+            "run_id": run_id,
+            "status": state["status"],
+            "message": state["message"],
+            "approval": state["approval"]
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Approval error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[{trace_id}] Error processing approval: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-# ============================================================================
-# BACKGROUND TASK EXECUTION FUNCTIONS
-# ============================================================================
-
-async def execute_task_async(run_id: str, initial_state: Dict[str, Any]):
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check() -> HealthCheckResponse:
     """
-    Execute task asynchronously in the background.
-    This will call P1's orchestrator to run the LangGraph DAG.
+    Check the health of the system
     
-    Placeholder for P1 integration:
-    from src.orchestrator import OrchestrationEngine
-    orchestrator = OrchestrationEngine()
-    result = await orchestrator.execute_dag(initial_state)
+    Request Format:
+    ```
+    GET /health
+    ```
+    
+    Returns:
+    ```json
+    {
+        "status": "healthy",
+        "timestamp": "2026-05-15T10:30:00Z",
+        "components": {
+            "api": "healthy",
+            "state_manager": "healthy",
+            "config_loader": "healthy",
+            "observability": "healthy"
+        },
+        "version": "1.0.0"
+    }
+    ```
     """
+    logger.info("Health check requested")
+    
+    components = {
+        "api": "healthy",
+        "state_manager": "healthy",
+        "config_loader": "healthy",
+        "observability": "healthy"
+    }
+    
+    # Verify state manager can write
     try:
-        logger.info(f"Starting async execution for task {run_id}")
-        
-        # TODO: Import from P1
+        test_id = f"test_{uuid.uuid4().hex[:8]}"
+        test_state = {"test": True, "timestamp": datetime.utcnow().isoformat()}
+        state_manager.save_checkpoint(test_id, "healthcheck", test_state)
+        # state_manager.delete_state(test_id)
+    except Exception as e:
+        logger.warning(f"State manager health check failed: {e}")
+        components["state_manager"] = "degraded"
+    
+    # Verify config loader can load
+    try:
+        config_loader.list_tenants()
+    except Exception as e:
+        logger.warning(f"Config loader health check failed: {e}")
+        components["config_loader"] = "degraded"
+    
+    return HealthCheckResponse(
+        status="healthy",
+        timestamp=datetime.utcnow().isoformat(),
+        components=components,
+        version="1.0.0"
+    )
+
+
+# ============================================================================
+# Background Tasks
+# ============================================================================
+
+async def execute_task_async(run_id: str, state: Dict[str, Any], trace_id: str) -> None:
+    """
+    Asynchronously execute a task
+    
+    This is where you'll integrate with P1's orchestrator.
+    For now, it simulates execution.
+    
+    Args:
+        run_id: The run ID
+        state: The task state
+        trace_id: The trace ID for observability
+    """
+    logger.info(f"[{trace_id}] Starting async execution for {run_id}")
+    
+    try:
+        # TODO: INTEGRATION POINT FOR P1
+        # Replace this with actual call to P1's orchestrator
         # from src.orchestrator import execute_dag
-        # await execute_dag(initial_state)
+        # result = await execute_dag(state)
         
-        # DEMO PLACEHOLDER: Simulate processing
-        tasks_store[run_id]["status"] = "processing"
-        tasks_store[run_id]["progress"] = "Analyzing request..."
+        # Simulate execution
+        state["status"] = "running"
+        state["progress"] = 25.0
+        state["message"] = "Executing task..."
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
         
-    except Exception as e:
-        logger.error(f"Async execution error for {run_id}: {str(e)}")
-        tasks_store[run_id]["status"] = "failed"
-        tasks_store[run_id]["error"] = str(e)
-
-
-async def resume_workflow_after_approval(run_id: str, task_state: Dict[str, Any]):
-    """
-    Resume LangGraph execution after approval.
+        await asyncio.sleep(2)
+        
+        state["progress"] = 50.0
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        await asyncio.sleep(2)
+        
+        # Simulate completion
+        state["status"] = "completed"
+        state["progress"] = 100.0
+        state["message"] = "Task completed successfully"
+        state["result"] = {
+            "output": f"Processed task: {state['task']}",
+            "tokens_used": 1234,
+            "cost": 0.05
+        }
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        # Record in observability
+        # observability.end_trace(trace_id, {
+        #     "status": "success",
+        #     "tokens": 1234,
+        #     "cost": 0.05
+        # })
+        
+        logger.info(f"[{trace_id}] Task execution completed: {run_id}")
     
-    Placeholder for P3 integration:
-    from src.memory.state import StateManager
-    state_manager = StateManager()
-    await state_manager.resume_workflow(run_id, task_state)
-    """
-    try:
-        logger.info(f"Resuming workflow for task {run_id} after approval")
-        
-        # TODO: Import from P3
-        # from src.memory.state import StateManager
-        # state_manager = StateManager()
-        # await state_manager.resume_workflow(run_id, task_state)
-        
-        # DEMO PLACEHOLDER
-        tasks_store[run_id]["progress"] = "Executing action..."
-        
     except Exception as e:
-        logger.error(f"Resumption error for {run_id}: {str(e)}")
-        tasks_store[run_id]["status"] = "failed"
-        tasks_store[run_id]["error"] = str(e)
+        logger.error(f"[{trace_id}] Task execution failed: {str(e)}", exc_info=True)
+        
+        state["status"] = "failed"
+        state["message"] = f"Execution failed: {str(e)}"
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        observability.end_trace(trace_id, {
+            "status": "error",
+            "error": str(e)
+        })
+
+
+async def resume_task_async(run_id: str, state: Dict[str, Any], trace_id: str) -> None:
+    """
+    Asynchronously resume a task after approval
+    
+    This is where you'll integrate with P1's orchestrator to resume.
+    For now, it simulates resumption.
+    
+    Args:
+        run_id: The run ID
+        state: The task state
+        trace_id: The trace ID for observability
+    """
+    logger.info(f"[{trace_id}] Resuming task after approval: {run_id}")
+    
+    try:
+        # TODO: INTEGRATION POINT FOR P1
+        # Resume execution with the approved state
+        
+        # Simulate resumption
+        state["status"] = "running"
+        state["progress"] = 75.0
+        state["message"] = "Resuming after approval..."
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        await asyncio.sleep(1)
+        
+        state["status"] = "completed"
+        state["progress"] = 100.0
+        state["message"] = "Task completed successfully"
+        state["result"] = {
+            "output": f"Completed task after approval: {state['task']}",
+            "tokens_used": 5678,
+            "cost": 0.10
+        }
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        # observability.end_trace(trace_id, {
+        #     "status": "success",
+        #     "tokens": 5678,
+        #     "cost": 0.10
+        # })
+        
+        logger.info(f"[{trace_id}] Task resumed and completed: {run_id}")
+    
+    except Exception as e:
+        logger.error(f"[{trace_id}] Task resumption failed: {str(e)}", exc_info=True)
+        
+        state["status"] = "failed"
+        state["message"] = f"Resumption failed: {str(e)}"
+        state["updated_at"] = datetime.utcnow().isoformat()
+        state_manager.save_checkpoint(run_id, "gateway", state)
+        
+        # observability.end_trace(trace_id, {
+        #     "status": "error",
+        #     "error": str(e)
+        # })
 
 
 # ============================================================================
-# EXCEPTION HANDLERS
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Standard HTTP exception handler"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "timestamp": datetime.now().isoformat()
-        },
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Catch-all exception handler"""
-    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "timestamp": datetime.now().isoformat()
-        },
-    )
-
-
-# ============================================================================
-# STARTUP/SHUTDOWN HOOKS
+# Startup/Shutdown Events
 # ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on app startup"""
-    logger.info("Agentic OS Gateway starting...")
+    """Initialize on startup"""
+    logger.info("=" * 80)
+    logger.info("Agentic OS Gateway Starting")
+    logger.info("=" * 80)
     
-    # Load tenant configurations
-    config_loader.load_all_configs()
-    logger.info("Tenant configurations loaded")
+    # Verify configuration
+    tenants = config_loader.list_tenants()
+    logger.info(f"Loaded {len(tenants)} tenant(s): {tenants}")
     
-    # Initialize observability
-    observability.initialize()
-    logger.info("Observability tracker initialized")
-    
-    # Initialize state manager
-    state_manager.initialize()
+    # Verify state manager
     logger.info("State manager initialized")
+    
+    # Verify observability
+    logger.info("Observability manager initialized")
+    
+    logger.info("=" * 80)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up resources on app shutdown"""
-    logger.info("Agentic OS Gateway shutting down...")
-    
-    # Graceful shutdown
-    await state_manager.cleanup()
-    logger.info("State manager cleaned up")
-
-
-# ============================================================================
-# ROOT ENDPOINT FOR TESTING
-# ============================================================================
-
-@app.get("/")
-async def root():
-    """Root endpoint for basic connectivity check"""
-    return {
-        "message": "Agentic OS Gateway is running",
-        "version": "1.0.0",
-        "endpoints": {
-            "health": "/health",
-            "submit_task": "POST /submit",
-            "get_status": "GET /status/{run_id}",
-            "approve_task": "POST /approve/{run_id}",
-            "docs": "/docs",
-            "openapi": "/openapi.json"
-        }
-    }
+    """Cleanup on shutdown"""
+    logger.info("=" * 80)
+    logger.info("Agentic OS Gateway Shutting Down")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
