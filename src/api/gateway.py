@@ -18,6 +18,11 @@ from enum import Enum
 from src.config_loader import ConfigLoader, get_tenant_config, get_config_loader
 from src.observability import ObservabilityTracker
 from src.memory.state import StateManager
+from src.api.observability import ObservabilityTracker
+
+# REAL orchestrator import
+from src.orchestrator import execute
+
 
 # Configure logging
 logging.basicConfig(
