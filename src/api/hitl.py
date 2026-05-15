@@ -1,161 +1,182 @@
 """
 HITL API — FastAPI router mounted at /hitl
+Part of Phase 3: Memory, State & Governance.
 
 Endpoints
 ---------
-POST /hitl/approve/{task_id}    — approve + resume a paused task
-POST /hitl/reject/{task_id}     — reject a paused task
-GET  /hitl/pending              — list all unresolved HITL tasks
-GET  /hitl/status/{task_id}     — full task + checkpoint + hitl snapshot
-GET  /hitl/checkpoints/{task_id}— all saved checkpoints for a task
+POST /hitl/approve/{run_id}    — approve + resume a paused audit
+POST /hitl/reject/{run_id}     — reject a paused audit
+GET  /hitl/pending             — list all unresolved HITL audits
+GET  /hitl/status/{run_id}     — full task + checkpoint + hitl snapshot
+GET  /hitl/checkpoints/{run_id}— all saved checkpoints for an audit trail
 
-All responses are JSON.  4xx errors are returned as {"detail": "..."}.
+All responses are JSON. 4xx errors are returned as {"detail": "..."}.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import json
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
-from src.memory.state import (
-    approve_task,
-    get_hitl_record,
-    get_task,
-    list_pending_hitl,
-    load_checkpoints,
-    reject_task,
-    resume_context,
-)
+from src.memory.state import StateManager, TaskStatus
 from src.memory.trace import TraceLogger
 
 router = APIRouter(prefix="/hitl", tags=["HITL"])
-logger = TraceLogger(component="api.hitl")
+
+# Initialize the global state manager instance (for MVP this is fine. 
+# For production, you might inject this via FastAPI Depends)
+state_manager = StateManager()
 
 
 # ── request / response models ─────────────────────────────────────────────────
 
 class ApproveRequest(BaseModel):
-    approved_by: str  = Field(..., description="Username or system ID approving the task")
-    resume_action: str = Field("continue", description="continue | retry | skip")
-
+    approved_by: str = Field(..., description="Username or system ID approving the audit (e.g., 'admin_1')")
+    feedback: Optional[str] = Field(None, description="Optional note to append to the audit trail")
 
 class RejectRequest(BaseModel):
-    rejected_by: str  = Field(..., description="Username or system ID rejecting the task")
-    reason:      str  = Field("", description="Human-readable rejection reason")
+    rejected_by: str = Field(..., description="Username or system ID rejecting the audit")
+    reason: str = Field(..., description="Mandatory reason for rejection (fed back to TraceLogger)")
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/approve/{task_id}", summary="Approve and resume a HITL-paused task")
-def approve(task_id: str, body: ApproveRequest):
+@router.post("/approve/{run_id}", summary="Approve and resume a HITL-paused audit")
+async def approve(run_id: str, body: ApproveRequest):
     """
-    Approve a task that is currently in **hitl_paused** state.
-
-    Transitions: hitl_paused → approved → (orchestrator picks up from checkpoint)
+    Approve an audit that is currently flagged as **hitl_paused**.
+    Transitions: hitl_paused → running (resumes orchestrator)
     """
-    task = get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
-    if task["state"] != "hitl_paused":
+    summary = state_manager.get_full_state_summary(run_id)
+    
+    if "error" in summary:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+        
+    if summary.get("status") != TaskStatus.HITL_PAUSED.value:
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"Task '{task_id}' is in state '{task['state']}', "
-                "not 'hitl_paused'. Cannot approve."
-            ),
+            detail=f"Run '{run_id}' is currently '{summary.get('status')}', not 'hitl_paused'."
         )
 
     try:
-        result = approve_task(
-            task_id=task_id,
-            approved_by=body.approved_by,
-            resume_action=body.resume_action,
+        new_state = await state_manager.resume_workflow(
+            run_id=run_id,
+            decision=TaskStatus.APPROVED,
+            feedback=body.feedback
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        
+        # Log the specific HITL resolution dynamically
+        logger = TraceLogger(component="api.hitl", run_id=run_id)
+        logger.log_approval(
+            approved_by=body.approved_by, 
+            action="approve", 
+            feedback=body.feedback
+        )
+
+        # TODO (Phase 1): Trigger Orchestrator wake-up event here or via message queue
+        
     except Exception as exc:
-        logger.log_event(event="approve_error", task_id=task_id, error=str(exc))
+        logger = TraceLogger(component="api.hitl", run_id=run_id)
+        logger.log_error(message="Failed to approve task", error=exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "status":  "approved",
-        "task_id": task_id,
-        **result,
+        "status": "approved",
+        "run_id": run_id,
+        "current_node": summary.get("current_node")
     }
 
 
-@router.post("/reject/{task_id}", summary="Reject a HITL-paused task")
-def reject(task_id: str, body: RejectRequest):
+@router.post("/reject/{run_id}", summary="Reject a HITL-paused audit")
+async def reject(run_id: str, body: RejectRequest):
     """
-    Reject a task in **hitl_paused** state.
-
-    Transitions: hitl_paused → rejected → failed
+    Reject an audit in **hitl_paused** state due to critical compliance failure.
+    Transitions: hitl_paused → failed
     """
-    task = get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
-    if task["state"] != "hitl_paused":
+    summary = state_manager.get_full_state_summary(run_id)
+    
+    if "error" in summary:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+        
+    if summary.get("status") != TaskStatus.HITL_PAUSED.value:
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"Task '{task_id}' is in state '{task['state']}', "
-                "not 'hitl_paused'. Cannot reject."
-            ),
+            detail=f"Run '{run_id}' is currently '{summary.get('status')}', not 'hitl_paused'."
         )
 
     try:
-        result = reject_task(
-            task_id=task_id,
-            rejected_by=body.rejected_by,
-            reason=body.reason,
+        new_state = await state_manager.resume_workflow(
+            run_id=run_id,
+            decision=TaskStatus.REJECTED,
+            feedback=body.reason
         )
+
+        logger = TraceLogger(component="api.hitl", run_id=run_id)
+        logger.log_state_transition(
+            from_state=TaskStatus.HITL_PAUSED.value,
+            to_state=TaskStatus.FAILED.value,
+            node_id=summary.get("current_node", "unknown")
+        )
+
     except Exception as exc:
-        logger.log_event(event="reject_error", task_id=task_id, error=str(exc))
+        logger = TraceLogger(component="api.hitl", run_id=run_id)
+        logger.log_error(message="Failed to reject task", error=exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "status":  "rejected",
-        "task_id": task_id,
-        **result,
+        "status": "rejected",
+        "run_id": run_id,
+        "reason": body.reason
     }
 
 
-@router.get("/pending", summary="List all tasks awaiting human review")
+@router.get("/pending", summary="List all audits awaiting human review")
 def pending():
-    """Return every unresolved HITL record across all tasks."""
-    records = list_pending_hitl()
+    """Return every unresolved HITL record across all clients."""
+    records = state_manager.list_active_hitl()
     return {"count": len(records), "tasks": records}
 
 
-@router.get("/status/{task_id}", summary="Full snapshot of task + HITL + latest checkpoint")
-def status(task_id: str):
+@router.get("/status/{run_id}", summary="Full snapshot of audit + HITL state")
+def status(run_id: str):
     """
-    Returns a combined view useful for the human reviewer:
-    - current task state and history
-    - active HITL record (reason, context, who flagged it)
-    - latest checkpoint so the reviewer knows where execution paused
+    Returns a combined view for your dashboard:
+    - current task state 
+    - active HITL reason (why the Judge flagged it)
+    - latest checkpoint payload
     """
-    task = get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    summary = state_manager.get_full_state_summary(run_id)
+    if "error" in summary:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+        
+    return summary
 
-    ctx = resume_context(task_id)
+
+@router.get("/checkpoints/{run_id}", summary="All saved checkpoints for an audit trail")
+def checkpoints(run_id: str):
+    """
+    Retrieves the entire history of an audit. 
+    Crucial for generating the final compliance evidence report.
+    """
+    history = []
+    # Glob through the checkpoint directory for all files belonging to this run
+    files = sorted(state_manager.checkpoint_dir.glob(f"{run_id}_*.json"))
+    
+    if not files:
+        raise HTTPException(status_code=404, detail=f"No checkpoints found for run '{run_id}'")
+
+    for file_path in files:
+        try:
+            with open(file_path, 'r') as f:
+                history.append(json.load(f))
+        except Exception:
+            continue
+
     return {
-        "task_id":     task_id,
-        "state":       task["state"],
-        "task":        ctx["task"],
-        "hitl":        ctx["hitl"],
-        "checkpoint":  ctx["checkpoint"],
+        "run_id": run_id,
+        "count": len(history),
+        "audit_trail": history
     }
-
-
-@router.get("/checkpoints/{task_id}", summary="All saved checkpoints for a task")
-def checkpoints(task_id: str):
-    task = get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
-
-    chkpts = load_checkpoints(task_id)
-    return {"task_id": task_id, "count": len(chkpts), "checkpoints": chkpts}

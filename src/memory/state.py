@@ -1,405 +1,230 @@
 """
-State Manager — checkpoint store, HITL flagging, and resume logic.
+State Manager — Checkpoint store, HITL flagging, and resume logic.
+Part of Phase 3: Memory, State & Governance.
 
-Storage backends (in priority order)
---------------------------------------
-1. Redis   — if REDIS_HOST is set and reachable
-2. Python dict — in-process fallback (ephemeral; fine for dev)
-
-Task lifecycle states
-----------------------
+Task lifecycle states:
   pending → running → hitl_paused → approved | rejected → completed | failed
-
-Every transition is validated against the allowed graph below.
 """
 
-from __future__ import annotations
-
 import json
-from typing import Dict, Any, Optional
+import logging
+import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
+from typing import Dict, Any, Optional, List
 
+# Setup Logger
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
+class TaskStatus(str, Enum):
+    """Deterministic states for the Agentic OS lifecycle."""
+    PENDING = "pending"
+    RUNNING = "running"
+    HITL_PAUSED = "hitl_paused"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 class StateManager:
     """
-    Manages workflow state, checkpointing, and resumption.
+    Manages workflow state, checkpointing, and resumption for the Compliance Service.
     
     Responsibilities:
-    1. Save checkpoints of workflow execution state
-    2. Resume interrupted workflows from checkpoints
-    3. Coordinate with HITL approval system
-    4. Integrate with P1's LangGraph for state persistence
-    
-    Implementation by Person 3:
-    - Use LangGraph's PostgreSQL or SQLite checkpointer
-    - Implement semantic caching with Redis
-    - Manage HITL state transitions
+    1. Save millisecond-precision checkpoints of workflow execution.
+    2. Resume interrupted workflows from the absolute latest state.
+    3. Coordinate Human-in-the-Loop (HITL) transitions.
+    4. Provide audit-ready state snapshots.
     """
-    
+
     def __init__(self, checkpoint_dir: str = "checkpoints"):
-        """
-        Initialize state manager.
-        
-        Args:
-            checkpoint_dir: Directory to store state checkpoints
-        """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # In-memory cache for fast hot-access
         self.state_cache: Dict[str, Dict[str, Any]] = {}
         
-        logger.info(f"StateManager initialized with checkpoint directory: {self.checkpoint_dir}")
-    
-    def initialize(self):
-        """Initialize the state manager at application startup"""
-        logger.info("StateManager initialization complete")
-    
+        logger.info(f"🚀 StateManager initialized. Path: {self.checkpoint_dir}")
+
     def save_checkpoint(
         self,
         run_id: str,
         node_id: str,
         state: Dict[str, Any],
-        status: str = "paused"
+        status: TaskStatus = TaskStatus.RUNNING
     ) -> str:
         """
-        Save a checkpoint of the current workflow state.
-        Called by LangGraph after each node execution.
-        
-        Args:
-            run_id: Unique task run ID
-            node_id: Current graph node ID
-            state: Complete workflow state dictionary
-            status: Current status (running, paused, awaiting_approval, completed, failed)
-        
-        Returns:
-            Checkpoint ID (same as run_id)
+        Saves a serialized snapshot of the current workflow.
+        Uses a timestamp-prefixed filename to ensure perfect chronological sorting.
         """
         try:
+            timestamp_ms = int(time.time() * 1000)
             checkpoint = {
                 "run_id": run_id,
                 "node_id": node_id,
-                "status": status,
+                "status": status.value,
                 "timestamp": datetime.now().isoformat(),
+                "unix_ts": timestamp_ms,
                 "state": state
             }
             
-            # Save to file (will be replaced with database in production)
-            checkpoint_file = self.checkpoint_dir / f"{run_id}_{node_id}.json"
+            # Pattern: runid_timestamp_nodeid.json (ensures latest is always sorted last)
+            filename = f"{run_id}_{timestamp_ms}_{node_id}.json"
+            checkpoint_file = self.checkpoint_dir / filename
+            
             with open(checkpoint_file, 'w') as f:
                 json.dump(checkpoint, f, indent=2, default=str)
             
-            # Also cache in memory for fast access
-            cache_key = f"{run_id}:{node_id}"
-            #self.state_cache[cache_key] = checkpoint
+            # Hot-cache the latest state
+            self.state_cache[run_id] = checkpoint
             
-            logger.info(f"Checkpoint saved: {run_id} at node {node_id}")
+            logger.info(f"💾 Checkpoint saved | Run: {run_id} | Node: {node_id} | Status: {status.value}")
             return run_id
         
         except Exception as e:
-            logger.error(f"Failed to save checkpoint for {run_id}: {str(e)}")
+            logger.error(f"❌ Failed to save checkpoint for {run_id}: {str(e)}")
             raise
-    
+
     def load_checkpoint(self, run_id: str, node_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Load a checkpoint from disk or cache.
-        Called when resuming a workflow.
-        
-        Args:
-            run_id: Unique task run ID
-            node_id: Optional specific node to load. If None, loads latest.
-        
-        Returns:
-            Checkpoint dictionary, or None if not found
+        Loads the latest checkpoint for a run, or a specific node if requested.
         """
         try:
-            # Try cache first
-            # cache_key = f"{run_id}:{node_id}" if node_id else run_id
-            # if cache_key in self.state_cache:
-            #     logger.debug(f"Checkpoint loaded from cache: {run_id}")
-            #     return self.state_cache[cache_key]
+            # Pattern match files for this specific run_id
+            checkpoints = list(self.checkpoint_dir.glob(f"{run_id}_*.json"))
+            if not checkpoints:
+                logger.warning(f"⚠️ No checkpoints found for run: {run_id}")
+                return None
             
-            # Load from file
             if node_id:
-                checkpoint_file = self.checkpoint_dir / f"{run_id}_{node_id}.json"
+                # Filter for a specific node if requested
+                matches = [c for c in checkpoints if node_id in c.name]
+                if not matches: return None
+                checkpoint_file = sorted(matches)[-1]
             else:
-                # Find latest checkpoint for this run
-                checkpoints = list(self.checkpoint_dir.glob(f"{run_id}_*.json"))
-                if not checkpoints:
-                    logger.warning(f"No checkpoints found for run {run_id}")
-                    return None
-                checkpoint_file = sorted(checkpoints)[-1]  # Latest by modification time
+                # Chronological sort based on the timestamp in filename
+                checkpoint_file = sorted(checkpoints)[-1]
             
-            if checkpoint_file.exists():
-                with open(checkpoint_file, 'r') as f:
-                    checkpoint = json.load(f)
-                
-                # Cache it
-                #self.state_cache[cache_key] = checkpoint
-                logger.info(f"Checkpoint loaded: {checkpoint_file}")
-                return checkpoint
-            
-            logger.warning(f"Checkpoint file not found: {checkpoint_file}")
-            return None
-        
+            with open(checkpoint_file, 'r') as f:
+                data = json.load(f)
+                return data
+
         except Exception as e:
-            logger.error(f"Failed to load checkpoint for {run_id}: {str(e)}")
+            logger.error(f"❌ Failed to load checkpoint: {str(e)}")
             return None
-    
-    async def resume_workflow(
-        self,
-        run_id: str,
-        state: Dict[str, Any],
-        node_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Resume a paused workflow from a checkpoint.
-        Called by the HITL approval endpoint when an approval is granted.
-        
-        Args:
-            run_id: Unique task run ID
-            state: Updated state (with approval status)
-            node_id: Optional specific node to resume from
-        
-        Returns:
-            Updated state after resumption
-        """
-        try:
-            logger.info(f"Resuming workflow: {run_id}")
-            
-            # Load latest checkpoint
-            checkpoint = self.load_checkpoint(run_id, node_id)
-            if not checkpoint:
-                raise Exception(f"No checkpoint found for {run_id}")
-            
-            # Merge approval state into checkpoint state
-            merged_state = {
-                **checkpoint["state"],
-                **state,
-                "status": "processing",
-                "approval_status": "approved",
-                "resumed_at": datetime.now().isoformat()
-            }
-            
-            # TODO: Resume LangGraph execution
-            # This will call P1's orchestrator.execute_dag_from_node()
-            # with the merged state
-            
-            logger.info(f"Workflow {run_id} resumed successfully")
-            return merged_state
-        
-        except Exception as e:
-            logger.error(f"Failed to resume workflow {run_id}: {str(e)}")
-            raise
-    
+
     def mark_for_approval(
         self,
         run_id: str,
         node_id: str,
         state: Dict[str, Any],
-        approval_reason: str
+        reason: str
     ) -> str:
         """
-        Mark a workflow as awaiting human approval.
-        Called by the Compliance Agent when a high-risk action is detected.
-        
-        Args:
-            run_id: Unique task run ID
-            node_id: Current node ID
-            state: Current workflow state
-            approval_reason: Why approval is needed
-        
-        Returns:
-            Checkpoint ID
+        Transitions the workflow to HITL_PAUSED.
+        Called when a 'Judge Agent' flags a compliance risk.
         """
-        try:
-            # Save checkpoint with approval status
-            state_with_approval = {
-                **state,
-                "requires_human_approval": True,
-                "approval_reason": approval_reason,
-                "approval_requested_at": datetime.now().isoformat()
+        updated_state = {
+            **state,
+            "hitl_metadata": {
+                "flagged_at": datetime.now().isoformat(),
+                "reason": reason,
+                "requires_action": True
             }
-            
-            checkpoint_id = self.save_checkpoint(
-                run_id=run_id,
-                node_id=node_id,
-                state=state_with_approval,
-                status="awaiting_approval"
-            )
-            
-            logger.info(f"Workflow {run_id} marked for approval: {approval_reason}")
-            return checkpoint_id
-        
-        except Exception as e:
-            logger.error(f"Failed to mark workflow for approval: {str(e)}")
-            raise
-    
-    def get_workflow_status(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the current status of a workflow.
-        
-        Args:
-            run_id: Unique task run ID
-        
-        Returns:
-            Status dictionary with current state and node info
-        """
-        try:
-            checkpoint = self.load_checkpoint(run_id)
-            if not checkpoint:
-                return None
-            
-            return {
-                "run_id": run_id,
-                "current_node": checkpoint.get("node_id"),
-                "status": checkpoint.get("status"),
-                "last_updated": checkpoint.get("timestamp"),
-                "requires_approval": checkpoint.get("state", {}).get("requires_human_approval", False),
-                "approval_reason": checkpoint.get("state", {}).get("approval_reason")
-            }
-        
-        except Exception as e:
-            logger.error(f"Failed to get workflow status: {str(e)}")
-            return None
-    
-    def list_waiting_approvals(self) -> list:
-        """
-        List all workflows currently awaiting human approval.
-        Useful for admin dashboards.
-        
-        Returns:
-            List of (run_id, approval_reason) tuples
-        """
-        try:
-            waiting = []
-            
-            # Scan all checkpoint files
-            for checkpoint_file in self.checkpoint_dir.glob("*.json"):
-                try:
-                    with open(checkpoint_file, 'r') as f:
-                        checkpoint = json.load(f)
-                    
-                    if checkpoint.get("status") == "awaiting_approval":
-                        waiting.append({
-                            "run_id": checkpoint["run_id"],
-                            "node_id": checkpoint["node_id"],
-                            "approval_reason": checkpoint.get("state", {}).get("approval_reason"),
-                            "timestamp": checkpoint.get("timestamp")
-                        })
-                
-                except Exception as e:
-                    logger.warning(f"Failed to read checkpoint {checkpoint_file}: {str(e)}")
-            
-            logger.info(f"Found {len(waiting)} workflows awaiting approval")
-            return waiting
-        
-        except Exception as e:
-            logger.error(f"Failed to list waiting approvals: {str(e)}")
-            return []
-    
-    def cleanup(self):
-        """Clean up resources (called on shutdown)"""
-        logger.info("StateManager cleaned up")
-    
-    # ========================================================================
-    # SEMANTIC CACHING METHODS (P3 to implement with Redis/FAISS)
-    # ========================================================================
-    
-    def cache_task_result(
+        }
+        return self.save_checkpoint(run_id, node_id, updated_state, status=TaskStatus.HITL_PAUSED)
+
+    async def resume_workflow(
         self,
         run_id: str,
-        request_hash: str,
-        intent_embedding: Optional[list],
-        result: Dict[str, Any],
-        ttl_seconds: int = 604800  # 7 days
-    ):
+        decision: TaskStatus,  # APPROVED or REJECTED
+        feedback: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Cache a task result for semantic matching.
-        Called after task completion.
-        
-        Implementation by P3:
-        - Store in Redis with TTL
-        - Generate vector embedding of request
-        - Index in FAISS for semantic search
-        
-        Args:
-            run_id: Task run ID
-            request_hash: Hash of original request
-            intent_embedding: Vector embedding of request intent
-            result: Final task output
-            ttl_seconds: Time to live for cache entry
+        Resumes a paused workflow based on human input.
         """
-        logger.debug(f"Caching result for run {run_id}")
-        # TODO: P3 Implementation
-    
-    def find_cached_result(
-        self,
-        request_hash: str,
-        intent_embedding: Optional[list],
-        similarity_threshold: float = 0.90
-    ) -> Optional[Dict[str, Any]]:
+        checkpoint = self.load_checkpoint(run_id)
+        if not checkpoint:
+            raise ValueError(f"Cannot resume. No state found for {run_id}")
+
+        current_state = checkpoint["state"]
+        
+        # Inject human decision into state
+        current_state["hitl_metadata"].update({
+            "decision": decision.value,
+            "feedback": feedback,
+            "resolved_at": datetime.now().isoformat(),
+            "requires_action": False
+        })
+
+        logger.info(f"🔄 Resuming workflow {run_id} with decision: {decision.value}")
+        
+        # Save new state as 'RUNNING' to trigger next node in Orchestrator
+        self.save_checkpoint(run_id, checkpoint["node_id"], current_state, status=TaskStatus.RUNNING)
+        return current_state
+
+    def get_full_state_summary(self, run_id: str) -> Dict[str, Any]:
         """
-        Find a cached result by semantic similarity.
-        Called before running orchestrator.
-        
-        Implementation by P3:
-        - Check exact hash match first (L1 cache)
-        - Perform cosine similarity search in FAISS (L2 cache)
-        - Return result if similarity > threshold
-        
-        Args:
-            request_hash: Hash of request
-            intent_embedding: Vector embedding of request
-            similarity_threshold: Minimum similarity to consider a match
-        
-        Returns:
-            Cached result, or None if not found or below threshold
+        Returns the specific state object needed for API responses.
+        As requested: includes task info, latest checkpoint, and HITL records.
         """
-        logger.debug(f"Searching for cached result similar to {request_hash}")
-        # TODO: P3 Implementation
+        checkpoint = self.load_checkpoint(run_id)
+        if not checkpoint:
+            return {"error": "Run not found"}
+
+        return {
+            "run_id": run_id,
+            "status": checkpoint.get("status"),
+            "current_node": checkpoint.get("node_id"),
+            "last_updated": checkpoint.get("timestamp"),
+            "checkpoint": checkpoint.get("state"),
+            "hitl": checkpoint.get("state", {}).get("hitl_metadata", {}),
+            "is_blocked": checkpoint.get("status") == TaskStatus.HITL_PAUSED
+        }
+
+    def list_active_hitl(self) -> List[Dict[str, Any]]:
+        """Scans for all workflows currently awaiting human approval."""
+        active_requests = []
+        # Find all current checkpoints
+        for file in self.checkpoint_dir.glob("*.json"):
+            try:
+                with open(file, 'r') as f:
+                    data = json.load(f)
+                    if data.get("status") == TaskStatus.HITL_PAUSED:
+                        active_requests.append({
+                            "run_id": data["run_id"],
+                            "reason": data["state"]["hitl_metadata"]["reason"],
+                            "timestamp": data["timestamp"]
+                        })
+            except: continue
+        return active_requests
+
+# ========================================================================
+# SEMANTIC CACHING STUBS (For P3 integration with Redis/Qdrant)
+# ========================================================================
+
+    def cache_final_result(self, request_hash: str, result: Dict[str, Any]):
+        """Future: Store successful audits in Qdrant for semantic reuse."""
+        pass
+
+    def find_cached_audit(self, request_hash: str) -> Optional[Dict[str, Any]]:
+        """Future: Look up if this vendor/policy combo has been audited before."""
         return None
 
-
-# ============================================================================
-# PLACEHOLDER FOR P3 INTEGRATION
-# ============================================================================
-
-class P3_IntegrationPlaceholder:
-    """
-    Placeholder showing where P3 (Memory Layer & HITL) will integrate.
-    
-    P3 Deliverables:
-    - memory_layer.py: L1 hash cache + L2 FAISS semantic cache
-    - trace_emitter.py: Structured logging of execution traces
-    - state_manager.py: Enhanced with Redis/FAISS integration
-    - hitl_handler.py: HITL approval flow coordination
-    
-    Integration points:
-    1. StateManager.cache_task_result() - Write to Redis + FAISS
-    2. StateManager.find_cached_result() - Query Redis/FAISS
-    3. StateManager.save_checkpoint() - Use LangGraph checkpointer
-    4. StateManager.resume_workflow() - Resume from LangGraph state
-    """
-    pass
-
-
+# ========================================================================
+# TEST EXECUTION
+# ========================================================================
 if __name__ == "__main__":
-    # Example usage
-    state_manager = StateManager()
+    sm = StateManager()
     
-    # Simulate a workflow
-    run_id = "test-run-001"
-    state = {
-        "tenant_id": "acme",
-        "original_request": "Create a customer refund",
-        "current_plan": ["validate_refund", "process_payment", "send_confirmation"],
-        "gathered_context": "Customer order found, valid refund reason"
-    }
-    """
-    return {
-        "task":       get_task(task_id),
-        "checkpoint": latest_checkpoint(task_id),
-        "hitl":       get_hitl_record(task_id),
-    }
+    # 1. Simulate Start
+    test_id = "audit_volvo_001"
+    initial_state = {"vendor": "Volvo", "policy": "SOC2_v3"}
+    sm.save_checkpoint(test_id, "ingestion_node", initial_state, status=TaskStatus.RUNNING)
+    
+    # 2. Simulate HITL Trigger
+    sm.mark_for_approval(test_id, "judge_node", initial_state, "Encryption key length not specified in SOC2")
+    
+    # 3. Check Status
+    print(json.dumps(sm.get_full_state_summary(test_id), indent=2))
