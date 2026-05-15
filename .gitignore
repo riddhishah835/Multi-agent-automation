@@ -42,3 +42,10 @@ htmlcov/
 
 # Docker
 .docker-compose.override.yml
+venv/
+__pycache__/
+*.pyc
+.env
+logs/
+checkpoints/
+
