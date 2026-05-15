@@ -202,6 +202,49 @@ RAW_TOOLS: List[Dict] = [
         "categories": ["security", "privacy", "availability", "financial", "kyc", "aml"],
         "cost_tier":  "low",
     },
+    # Add these to RAW_TOOLS list:
+{
+    "name": "pdf_extractor",
+    "description": "Extract and parse compliance documents SOC2 ISO certificates AML KYC privacy policy contracts",
+    "allowed_tenants": ["*"],
+    "input_schema": {"file_path": "string", "doc_type": "string"},
+    "output_schema": {"extracted_text": "string", "sections": "object"},
+},
+{
+    "name": "compliance_checker",
+    "description": "Check vendor compliance against SOC2 ISO27001 AML KYC regulatory standards requirements",
+    "allowed_tenants": ["tenant_jpmorgan", "tenant_goldman", "tenant_stripe", "tenant_razorpay"],
+    "input_schema": {"vendor_id": "string", "standard": "string", "document_text": "string"},
+    "output_schema": {"compliant": "bool", "gaps": "list", "risk_score": "string"},
+},
+{
+    "name": "risk_scorer",
+    "description": "Score vendor risk level based on security encryption privacy financial stability",
+    "allowed_tenants": ["*"],
+    "input_schema": {"vendor_data": "object"},
+    "output_schema": {"risk_score": "string", "flags": "list", "recommendation": "string"},
+},
+{
+    "name": "contract_analyzer",
+    "description": "Analyze vendor contracts SLA terms liability clauses legal obligations",
+    "allowed_tenants": ["tenant_jpmorgan", "tenant_goldman"],
+    "input_schema": {"contract_text": "string"},
+    "output_schema": {"key_clauses": "list", "red_flags": "list", "summary": "string"},
+},
+{
+    "name": "report_generator",
+    "description": "Generate vendor onboarding compliance report summary for procurement legal team",
+    "allowed_tenants": ["*"],
+    "input_schema": {"vendor_id": "string", "findings": "object"},
+    "output_schema": {"report": "string", "approved": "bool"},
+},
+{
+    "name": "vendor_database_lookup",
+    "description": "Lookup existing vendor records sanctions lists blacklists financial history",
+    "allowed_tenants": ["tenant_jpmorgan", "tenant_goldman", "tenant_stripe"],
+    "input_schema": {"vendor_name": "string", "vendor_id": "string"},
+    "output_schema": {"vendor_record": "object", "sanctions_hit": "bool"},
+},
 ]
 
 

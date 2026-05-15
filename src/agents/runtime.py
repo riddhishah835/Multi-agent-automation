@@ -342,7 +342,20 @@ def _parse_reader_output(raw_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         log.warning("reader: response was not JSON — wrapping as raw text")
         return {"evidence_cards": [], "raw_response": raw_text}
-
+def vendor_onboarding_agent(
+    task: str,
+    tenant_id: str,
+    context: Dict[str, Any] = {}
+) -> AgentResult:
+    """
+    Orchestrates full vendor onboarding review:
+    - Extracts docs (SOC2, ISO, AML, contracts)
+    - Scores risk
+    - Checks compliance gaps
+    - Generates final report
+    HIGH RISK: generates approval reports → always requires HITL before finalization.
+    """
+    return _run_agent("vendor_onboarding", task, tenant_id, context)
 
 def _parse_judge_output(raw_text: str) -> Dict[str, Any]:
     """

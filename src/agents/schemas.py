@@ -95,7 +95,22 @@ class AgentResult(BaseModel):
 
 
 # ── Audit state (used by P1 & P3) ────────────────────────────────────────────
+class VendorOnboardingRequest(BaseModel):
+    tenant_id: str
+    vendor_name: str
+    vendor_id: str
+    documents: List[str]        # list of file paths
+    standards_required: List[str]  # ["SOC2", "ISO27001", "AML"]
+    workflow_id: str = "vendor_onboarding"
 
+class VendorOnboardingResult(BaseModel):
+    vendor_id: str
+    risk_score: str             # "low", "medium", "high"
+    compliant: bool
+    gaps: List[str]
+    recommendation: str
+    report: str
+    requires_human_review: bool
 class AuditState(BaseModel):
     """
     Snapshot of a single audit's lifecycle, persisted to Postgres by P3.
