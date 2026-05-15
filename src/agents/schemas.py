@@ -13,8 +13,9 @@ These are the canonical data contracts between:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
+from typing import Literal, Optional, List, Dict, Any
 
 
 # ── Tool schema (also used by registry.py) ────────────────────────────────────
@@ -130,3 +131,25 @@ class AuditState(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     hitl_override: bool = False             # True once human reviewer approves
     hitl_notes: str = ""
+
+
+    # Add these at the bottom of schemas.py:
+
+class ComplianceFinding(BaseModel):
+    control: str
+    status: Literal["pass", "fail", "partial", "not_mentioned"]
+    evidence: Optional[str]
+    gap: Optional[str]
+    severity: Literal["low", "medium", "high"]
+
+class LLMComplianceResult(BaseModel):
+    vendor: str
+    standard: str
+    overall_compliant: bool
+    confidence: float
+    risk_level: Literal["low", "medium", "high", "critical"]
+    findings: List[ComplianceFinding]
+    summary: str
+    recommendation: Literal["approve", "conditional_approve", "reject", "request_more_docs"]
+    contradictions_found: bool
+    risk_narrative: str

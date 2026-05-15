@@ -29,6 +29,13 @@ import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+# Add to imports at top:
+from src.agents.llm_reasoner import (
+    analyze_compliance_document,
+    detect_contradictions,
+    extract_evidence,
+    generate_risk_narrative,
+)
 
 import os
 import google.generativeai as genai  # pip install google-generativeai
@@ -534,3 +541,62 @@ Style rules:
 - Never invent facts not present in the findings JSON.
 - Output ONLY the Markdown report. No JSON, no preamble.
 """.strip()
+
+def compliance_reasoning_agent(
+    task: str,
+    tenant_id: str,
+    context: Dict[str, Any] = {}
+) -> AgentResult:
+    """
+    LLM-powered compliance agent. Goes beyond keyword matching.
+    """
+    document_text = context.get("document_text", "No document provided.")
+    standard      = context.get("standard", "SOC2")
+    vendor_name   = context.get("vendor_name", "Unknown Vendor")
+    controls      = context.get("controls", ["encryption at rest", "MFA", "data retention", "audit logging"])
+
+    try:
+        # Step 1 — LLM compliance analysis
+        compliance = analyze_compliance_document(document_text, standard, vendor_name)
+
+        # Step 2 — Contradiction detection
+        contradictions = detect_contradictions(document_text, vendor_name)
+
+        # Step 3 — Evidence extraction per control
+        evidence_map = {}
+        for control in controls:
+            evidence_map[control] = extract_evidence(document_text, control, vendor_name)
+
+        # Step 4 — Risk narrative
+        narrative = generate_risk_narrative(
+            vendor_name,
+            compliance.get("findings", []),
+            contradictions,
+        )
+
+        return AgentResult(
+            agent_name="compliance_reasoning",
+            status="success",
+            output={
+                "vendor": vendor_name,
+                "standard": standard,
+                "compliance_analysis": compliance,
+                "contradictions": contradictions,
+                "evidence_map": evidence_map,
+                "risk_narrative": narrative,
+                "final_recommendation": compliance.get("recommendation", "request_more_docs"),
+            },
+            tools_used=["llm_reasoner", "compliance_checker", "pdf_extractor"],
+        )
+
+    except Exception as e:
+        print(f"compliance_reasoning_agent error: {e}")
+        import traceback
+        traceback.print_exc()
+        return AgentResult(
+            agent_name="compliance_reasoning",
+            status="failed",
+            output={},
+            tools_used=[],
+            error=str(e),
+        )
