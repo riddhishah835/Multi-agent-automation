@@ -200,52 +200,44 @@ async def node_adversarial_audit(state: AuditState) -> AuditState:
     # ENCRYPTION
     # -------------------------------------------------------------------------
 
-    if rules["encryption"]["required"]:
-        if "encryption" not in document_text.lower():
-            findings.append({
-                "severity": rules["encryption"]["severity"],
-                "issue": "Missing encryption at rest",
-                "status": "non_compliant",
-                "evidence": "No encryption-related controls detected in document",
-                "page_reference": "Document-wide search",
-                "frameworks": state["retrieved_rules"]["compliance_frameworks"]
-            })
-        else:
-            coverage["encryption"] = True
+    for control_name, control_config in rules.items():
 
-    # -------------------------------------------------------------------------
-    # MFA
-    # -------------------------------------------------------------------------
+        if not control_config["required"]:
+            continue
 
-    if rules["mfa"]["required"]:
-        if "mfa" not in document_text.lower():
-            findings.append({
-                "severity": rules["mfa"]["severity"],
-                "issue": "MFA not enabled",
-                "status": "non_compliant",
-                "evidence": "No MFA-related controls detected in document",
-                "page_reference": "Document-wide search",
-                "frameworks": state["retrieved_rules"]["compliance_frameworks"]
-            })
-        else:
-            coverage["mfa"] = True
+    keywords = control_config["keywords"]
 
-    # -------------------------------------------------------------------------
-    # AUDIT LOGGING
-    # -------------------------------------------------------------------------
+    found = any(
+        keyword.lower() in document_text.lower()
+        for keyword in keywords
+    )
 
-    if rules["audit_logging"]["required"]:
-        if "audit log" not in document_text.lower():
-            findings.append({
-                "severity": rules["audit_logging"]["severity"],
-                "issue": "Audit logging controls missing",
-                "status": "non_compliant",
-                "evidence": "No audit logging controls detected in document",
-                "page_reference": "Document-wide search",
-                "frameworks": state["retrieved_rules"]["compliance_frameworks"]
-            })
-        else:
-            coverage["audit_logging"] = True
+    coverage[control_name] = found
+
+    matched_keyword = None
+
+    for keyword in keywords:
+        if keyword.lower() in document_text.lower():
+            matched_keyword = keyword
+            break
+            
+    if not found:
+
+        findings.append({
+            "severity": control_config["severity"],
+            "issue": f"{control_name.replace('_', ' ').title()} controls missing",
+            "status": "non_compliant",
+            "evidence": (
+                f"Detected keyword: {matched_keyword}"
+                if matched_keyword
+                else f"No {control_name.replace('_', ' ')} controls detected in document"
+            ),
+            "finding_id": f"F-{len(findings)+1:03}",
+            "page_reference": "Document-wide search",
+            "frameworks": state["retrieved_rules"]["compliance_frameworks"],
+            "control_description": control_config["description"],
+            "confidence": 0.92
+        })
 
     state["control_coverage"] = coverage
     state["audit_findings"] = findings
@@ -356,6 +348,14 @@ async def node_report_generation(state: AuditState) -> AuditState:
     report = f"""
 # Compliance Audit Report
 
+## Executive Decision
+
+Vendor Risk Level: {state["risk_level"]}
+
+Recommendation: {state["approval_recommendation"]}
+
+Compliance Status: {state["compliance_status"]}
+
 ## Final Recommendation
 {state["approval_recommendation"]}
 
@@ -395,7 +395,7 @@ async def node_report_generation(state: AuditState) -> AuditState:
 ## Findings
 
 {chr(10).join([
-    f"- [{f['severity']}] {f['issue']}\n  Evidence: {f['evidence']}\n  Source Reference: {f['page_reference']}"
+    f"- [{f['severity']}] {f['issue']}\n  Evidence: {f['evidence']}\n  Source Reference: {f['page_reference']} Frameworks: {', '.join(f['frameworks'])}"
     for f in findings
 ]) if findings else "No compliance issues detected."}
 
@@ -408,6 +408,12 @@ async def node_report_generation(state: AuditState) -> AuditState:
 
 ## Audit Completed At
 {state["audit_completed_at"]}
+
+## Audit Metadata
+
+- Run ID: {state["run_id"]}
+- Tenant: {state["tenant_id"]}
+- Audit Timestamp: {state["audit_completed_at"]}
 
 ## Status
 Audit completed successfully.
