@@ -54,7 +54,7 @@ export default function Login() {
           <span className="brand__logo login-card__logo">
             <Shield size={28} />
           </span>
-          <h1>Vendor Compliance OS</h1>
+          <h1>Pramana</h1>
           <p>Sign in to your compliance workspace</p>
         </header>
 

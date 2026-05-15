@@ -1,10 +1,50 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { FileText, Link2 } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
-import { evidenceItems } from '../data/mockData';
+import { getAuditState } from '../api/client';
+import { useToast } from '../context/ToastContext';
 
 export default function EvidenceViewer() {
-  const [selected, setSelected] = useState(evidenceItems[0]);
+  const { addToast } = useToast();
+  const [evidenceItems, setEvidenceItems] = useState([]);
+  const [selected, setSelected] = useState(null);
+
+  useEffect(() => {
+    const auditId = localStorage.getItem('current_audit_id');
+    let errorToastShown = false;
+
+    if (!auditId) return;
+
+    const fetchState = async () => {
+      try {
+        const state = await getAuditState(auditId);
+        if (state && state.findings) {
+          const mapped = state.findings.map((f, i) => ({
+            id: f.finding_id || `ev-${i}`,
+            findingId: f.finding_id || `F-${i+1}`,
+            category: f.issue || 'Compliance Issue',
+            quote: f.evidence || 'No evidence provided.',
+            page: f.page_reference || 'N/A',
+            source: (f.frameworks || []).join(', ') || 'Framework'
+          }));
+          setEvidenceItems(mapped);
+          
+          if (mapped.length > 0 && (!selected || !mapped.find(m => m.id === selected?.id))) {
+            setSelected(mapped[0]);
+          }
+        }
+      } catch (err) {
+        if (!errorToastShown) {
+          addToast('Backend disconnected - showing empty evidence', 'error');
+          errorToastShown = true;
+        }
+      }
+    };
+
+    fetchState();
+    const interval = setInterval(fetchState, 2000);
+    return () => clearInterval(interval);
+  }, [addToast, selected?.id]);
 
   return (
     <>
@@ -29,6 +69,11 @@ export default function EvidenceViewer() {
                 </button>
               </li>
             ))}
+            {evidenceItems.length === 0 && (
+              <li className="empty-state" style={{ padding: '1rem', color: 'var(--text-muted)' }}>
+                No evidence items available.
+              </li>
+            )}
           </ul>
         </article>
 
@@ -42,7 +87,7 @@ export default function EvidenceViewer() {
             <dl className="evidence-meta">
               <div>
                 <dt>Page</dt>
-                <dd>Page {selected.page}</dd>
+                <dd>{selected.page}</dd>
               </div>
               <div>
                 <dt>Source</dt>

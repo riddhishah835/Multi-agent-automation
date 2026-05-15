@@ -1,0 +1,30 @@
+# Default tenant configuration (fallback)
+tenant_id: default
+tenant_name: Default Tenant
+description: Default configuration for unknown tenants
+
+enabled_agents:
+  - context
+  - execution
+  - compliance
+  - editor
+
+enabled_workflows:
+  - default
+
+authorized_tools: []
+
+policy_rules:
+  output_format: markdown
+  tone: professional
+  max_output_length: 2000
+
+compliance_rules:
+  check_pii: true
+  check_security: true
+  require_approval_for_mutations: true
+
+rate_limits:
+  requests_per_minute: 60
+  tokens_per_day: 500000
+  max_concurrent_tasks: 5

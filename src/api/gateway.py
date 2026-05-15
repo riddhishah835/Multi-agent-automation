@@ -16,12 +16,11 @@ from enum import Enum
 
 # Import our modules
 from src.config_loader import ConfigLoader, get_tenant_config, get_config_loader
-from src.observability import ObservabilityTracker
 from src.memory.state import StateManager
 from src.api.observability import ObservabilityTracker
 
 # REAL orchestrator import
-from src.orchestrator import execute
+from src.orchestrator import run_audit
 
 
 # Configure logging
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 config_loader = get_config_loader("configs")
-observability = ObservabilityTracker("agentic_os")
+observability = ObservabilityTracker()
 state_manager = StateManager("checkpoints")
 
 # Create FastAPI app
@@ -54,8 +53,10 @@ class TaskStatus(str, Enum):
     """Task status enumeration"""
     PENDING = "pending"
     RUNNING = "running"
-    WAITING_APPROVAL = "waiting_approval"
+    HITL_PAUSED = "hitl_paused"
+    WAITING_APPROVAL = "waiting_approval"  # Keep for backward compat
     APPROVED = "approved"
+    REJECTED = "rejected"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -124,6 +125,10 @@ def extract_tenant_id(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Invalid token format")
     
     tenant_id = token.replace("tenant_", "")
+    
+    # Strip version suffix (e.g. acme_v1 -> acme)
+    if "_v" in tenant_id:
+        tenant_id = tenant_id.rsplit("_v", 1)[0]
     
     if not tenant_id:
         raise HTTPException(status_code=401, detail="Missing tenant ID")
@@ -291,6 +296,16 @@ async def get_status(
             logger.warning(f"[{trace_id}] Tenant mismatch for run: {run_id}")
             raise HTTPException(status_code=403, detail="Unauthorized")
         
+        # Ensure result exists even during execution
+        result = state.get("result")
+        if not result and "parsed_documents" in state:
+            result = {
+                "vendor_name": state.get("parsed_documents", {}).get("vendor_name", "Unknown"),
+                "risk_score": state.get("risk_score", 0),
+                "findings": state.get("audit_findings", []),
+                "draft_report": state.get("draft_report", "")
+            }
+            
         # Create response
         response = TaskStatusResponse(
             run_id=run_id,
@@ -298,7 +313,7 @@ async def get_status(
             progress=state.get("progress", 0.0),
             message=state.get("message", ""),
             needs_approval=state.get("needs_approval", False),
-            result=state.get("result")
+            result=result
         )
         
         logger.info(f"[{trace_id}] Status returned: {response.status}")
@@ -308,6 +323,70 @@ async def get_status(
         raise
     except Exception as e:
         logger.error(f"[{trace_id}] Error getting status: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/history", response_model=List[Dict[str, Any]])
+async def get_history(authorization: Optional[str] = Header(None)) -> List[Dict[str, Any]]:
+    """
+    Get audit history for the current tenant
+    """
+    trace_id = str(uuid.uuid4())
+    logger.info(f"[{trace_id}] Fetching history")
+    
+    try:
+        tenant_id = extract_tenant_id(authorization)
+        
+        # We need to find all unique run_ids for this tenant.
+        # Checkpoints are in state_manager.checkpoint_dir
+        history = []
+        run_ids = set()
+        
+        for file_path in state_manager.checkpoint_dir.glob("*.json"):
+            try:
+                # The filename format is usually: run_id_timestamp_node.json or run_id.json
+                parts = file_path.stem.split('_')
+                if len(parts) >= 2 and parts[0] == "run":
+                    run_id = f"{parts[0]}_{parts[1]}"
+                    run_ids.add(run_id)
+                elif file_path.stem.startswith("run_"):
+                    run_ids.add(file_path.stem)
+            except Exception:
+                continue
+                
+        for run_id in run_ids:
+            checkpoint = state_manager.load_checkpoint(run_id)
+            if not checkpoint: continue
+            state = checkpoint.get("state", {})
+            if state.get("tenant_id") != tenant_id: continue
+            
+            # Map to frontend format
+            status = state.get("status", "pending")
+            outcome = "failed"
+            if status == "completed": outcome = "approved"
+            elif status == "rejected": outcome = "failed"
+            elif status == "hitl_paused": outcome = "pending"
+            elif status == "running": outcome = "pending"
+            
+            risk_level = "low"
+            score = state.get("risk_score", 0)
+            if score > 70: risk_level = "high"
+            elif score > 30: risk_level = "medium"
+            
+            history.append({
+                "id": run_id,
+                "vendor": state.get("parsed_documents", {}).get("vendor_name", "Unknown Vendor"),
+                "date": state.get("audit_completed_at", state.get("updated_at", "Pending"))[:10],
+                "risk": risk_level,
+                "framework": ", ".join(state.get("retrieved_rules", {}).get("compliance_frameworks", [])),
+                "outcome": outcome,
+                "analyst": state.get("approval_data", {}).get("approver_id", "System (AI)")
+            })
+            
+        return sorted(history, key=lambda x: x["date"], reverse=True)
+        
+    except Exception as e:
+        logger.error(f"[{trace_id}] Error fetching history: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -350,8 +429,8 @@ async def approve_task(
         # Extract and validate tenant
         tenant_id = extract_tenant_id(authorization)
         
-        # Load state
-        checkpoint = state_manager.load_checkpoint(run_id,"gateway")
+        # Load state (get latest checkpoint regardless of node)
+        checkpoint = state_manager.load_checkpoint(run_id)
         state = checkpoint["state"] if checkpoint else None
         
         if not state:
@@ -364,7 +443,7 @@ async def approve_task(
             raise HTTPException(status_code=403, detail="Unauthorized")
         
         # Verify task is waiting for approval
-        if state.get("status") != "waiting_approval":
+        if state.get("status") not in ["waiting_approval", "hitl_paused"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Task is not waiting for approval (current status: {state.get('status')})"
@@ -485,43 +564,38 @@ async def execute_task_async(run_id: str, state: Dict[str, Any], trace_id: str) 
     logger.info(f"[{trace_id}] Starting async execution for {run_id}")
     
     try:
-        # TODO: INTEGRATION POINT FOR P1
-        # Replace this with actual call to P1's orchestrator
-        # from src.orchestrator import execute_dag
-        # result = await execute_dag(state)
+        from src.orchestrator import run_audit
+        from src.memory.state import TaskStatus
         
-        # Simulate execution
-        state["status"] = "running"
-        state["progress"] = 25.0
-        state["message"] = "Executing task..."
-        state["updated_at"] = datetime.utcnow().isoformat()
-        state_manager.save_checkpoint(run_id, "gateway", state)
+        audit_state = {
+            "run_id": run_id,
+            "tenant_id": state.get("tenant_id", "acme"),
+            "uploaded_files": state.get("metadata", {}).get("files", ["mock_vendor_compliance_packet.pdf"]),
+            "status": "initialized",
+            "current_node": "start",
+            "parsed_documents": {},
+            "retrieved_rules": {},
+            "audit_findings": [],
+            "gap_analysis": [],
+            "requires_human_review": False
+        }
         
-        await asyncio.sleep(2)
+        final_state = await run_audit(audit_state)
         
-        state["progress"] = 50.0
-        state_manager.save_checkpoint(run_id, "gateway", state)
-        
-        await asyncio.sleep(2)
-        
-        # Simulate completion
-        state["status"] = "completed"
+        # Simulate completion based on orchestrator state
+        task_status = TaskStatus.HITL_PAUSED if final_state.get("requires_human_review") else TaskStatus.COMPLETED
+        state["status"] = task_status.value
         state["progress"] = 100.0
-        state["message"] = "Task completed successfully"
+        state["message"] = final_state.get("current_node", "completed")
+        state["needs_approval"] = final_state.get("requires_human_review", False)
         state["result"] = {
-            "output": f"Processed task: {state['task']}",
-            "tokens_used": 1234,
-            "cost": 0.05
+            "vendor_name": final_state.get("parsed_documents", {}).get("vendor_name", "Unknown"),
+            "risk_score": final_state.get("risk_score", 0),
+            "findings": final_state.get("audit_findings", []),
+            "draft_report": final_state.get("draft_report", "")
         }
         state["updated_at"] = datetime.utcnow().isoformat()
-        state_manager.save_checkpoint(run_id, "gateway", state)
-        
-        # Record in observability
-        # observability.end_trace(trace_id, {
-        #     "status": "success",
-        #     "tokens": 1234,
-        #     "cost": 0.05
-        # })
+        state_manager.save_checkpoint(run_id, "gateway", state, status=task_status)
         
         logger.info(f"[{trace_id}] Task execution completed: {run_id}")
     
@@ -554,34 +628,25 @@ async def resume_task_async(run_id: str, state: Dict[str, Any], trace_id: str) -
     logger.info(f"[{trace_id}] Resuming task after approval: {run_id}")
     
     try:
-        # TODO: INTEGRATION POINT FOR P1
+        from src.orchestrator import resume_audit
+        
         # Resume execution with the approved state
+        approved = state.get("approval", {}).get("approved", False)
         
-        # Simulate resumption
-        state["status"] = "running"
-        state["progress"] = 75.0
-        state["message"] = "Resuming after approval..."
-        state["updated_at"] = datetime.utcnow().isoformat()
-        state_manager.save_checkpoint(run_id, "gateway", state)
+        final_state = await resume_audit(run_id)
         
-        await asyncio.sleep(1)
-        
-        state["status"] = "completed"
+        state["status"] = "completed" if approved else "rejected"
         state["progress"] = 100.0
-        state["message"] = "Task completed successfully"
+        state["message"] = "Task completed successfully" if approved else "Task rejected"
         state["result"] = {
-            "output": f"Completed task after approval: {state['task']}",
-            "tokens_used": 5678,
-            "cost": 0.10
+            "output": f"Completed task after approval: {state.get('task', '')}",
+            "vendor_name": final_state.get("parsed_documents", {}).get("vendor_name", "Unknown"),
+            "risk_score": final_state.get("risk_score", 0),
+            "findings": final_state.get("audit_findings", []),
+            "draft_report": final_state.get("draft_report", "")
         }
         state["updated_at"] = datetime.utcnow().isoformat()
         state_manager.save_checkpoint(run_id, "gateway", state)
-        
-        # observability.end_trace(trace_id, {
-        #     "status": "success",
-        #     "tokens": 5678,
-        #     "cost": 0.10
-        # })
         
         logger.info(f"[{trace_id}] Task resumed and completed: {run_id}")
     

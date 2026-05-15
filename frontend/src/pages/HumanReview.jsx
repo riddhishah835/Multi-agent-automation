@@ -1,17 +1,58 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import PageHeader from '../components/common/PageHeader';
 import SeverityBadge from '../components/common/SeverityBadge';
 import PipelineTimeline from '../components/common/PipelineTimeline';
 import { useToast } from '../context/ToastContext';
-import { pendingApprovals, pipelineSteps } from '../data/mockData';
+import { pipelineSteps } from '../data/mockData';
+import { sendHITLDecision, getAuditState } from '../api/client';
 
 export default function HumanReview() {
   const { addToast } = useToast();
-  const [selected, setSelected] = useState(pendingApprovals[0]);
+  const [selected, setSelected] = useState(null);
   const [comment, setComment] = useState('');
 
-  const act = (action) => {
-    addToast(`${selected.vendor}: ${action}`, action === 'rejected' ? 'error' : 'success');
+  useEffect(() => {
+    const auditId = localStorage.getItem('current_audit_id');
+    if (!auditId) return;
+
+    const fetchState = async () => {
+      try {
+        const state = await getAuditState(auditId);
+        if (state && state.status === 'hitl_paused') {
+          setSelected({
+            id: auditId,
+            vendor: state.vendor_name || 'Unknown Vendor',
+            riskScore: state.risk_score || 0,
+            aiRecommendation: 'review',
+            summary: 'AI has flagged this audit for manual review due to compliance concerns.',
+            submittedAt: new Date().toLocaleDateString()
+          });
+        } else {
+          setSelected(null);
+        }
+      } catch (err) {
+        // Silently fail or log, user might not have a pending audit
+      }
+    };
+
+    fetchState();
+    const interval = setInterval(fetchState, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const act = async (action) => {
+    if (action === 'more docs requested') {
+      addToast(`${selected.vendor}: ${action}`, 'success');
+      return;
+    }
+    try {
+      const auditId = selected.id;
+      await sendHITLDecision(auditId, action);
+      addToast(`${selected.vendor}: ${action}`, action === 'rejected' ? 'error' : 'success');
+      setSelected(null); // Clear from list after decision
+    } catch (err) {
+      addToast('Backend disconnected - using demo mode', 'error');
+    }
   };
 
   return (
@@ -23,22 +64,25 @@ export default function HumanReview() {
 
       <section className="review-layout">
         <article className="card review-queue">
-          <h2 className="card__title">Pending approvals ({pendingApprovals.length})</h2>
+          <h2 className="card__title">Pending approvals ({selected ? 1 : 0})</h2>
           <ul className="review-list">
-            {pendingApprovals.map((a) => (
-              <li key={a.id}>
+            {selected && (
+              <li key={selected.id}>
                 <button
                   type="button"
-                  className={`review-card${selected?.id === a.id ? ' review-card--active' : ''}`}
-                  onClick={() => setSelected(a)}
+                  className="review-card review-card--active"
+                  onClick={() => {}}
                 >
-                  <strong>{a.vendor}</strong>
-                  <span className="text-muted">{a.id}</span>
-                  <span className="review-card__risk">Risk: {a.riskScore}/100</span>
-                  <SeverityBadge level={a.aiRecommendation === 'reject' ? 'high' : a.aiRecommendation === 'approve' ? 'low' : 'medium'} />
+                  <strong>{selected.vendor}</strong>
+                  <span className="text-muted">{selected.id}</span>
+                  <span className="review-card__risk">Risk: {selected.riskScore}/100</span>
+                  <SeverityBadge level={selected.aiRecommendation === 'reject' ? 'high' : selected.aiRecommendation === 'approve' ? 'low' : 'medium'} />
                 </button>
               </li>
-            ))}
+            )}
+            {!selected && (
+              <li className="empty-state">No audits currently waiting for human review.</li>
+            )}
           </ul>
         </article>
 

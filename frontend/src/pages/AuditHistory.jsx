@@ -4,6 +4,7 @@ import { Search } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import SeverityBadge from '../components/common/SeverityBadge';
 import StatusBadge from '../components/common/StatusBadge';
+import { getHistory } from '../api/client';
 import { auditHistory } from '../data/mockData';
 
 export default function AuditHistory() {
@@ -11,6 +12,24 @@ export default function AuditHistory() {
   const [vendor, setVendor] = useState('');
   const [risk, setRisk] = useState('all');
   const [framework, setFramework] = useState('all');
+  const [historyData, setHistoryData] = useState(auditHistory);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      try {
+        const data = await getHistory();
+        if (data && data.length > 0) {
+          setHistoryData(data);
+        }
+      } catch (err) {
+        console.error('Error fetching history:', err);
+      }
+    };
+    fetchHistory();
+    // Poll every 5 seconds for updates
+    const interval = setInterval(fetchHistory, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const q = params.get('vendor');
@@ -18,13 +37,13 @@ export default function AuditHistory() {
   }, [params]);
 
   const filtered = useMemo(() => {
-    return auditHistory.filter((a) => {
+    return historyData.filter((a) => {
       if (vendor && !a.vendor.toLowerCase().includes(vendor.toLowerCase())) return false;
       if (risk !== 'all' && a.risk !== risk) return false;
       if (framework !== 'all' && !a.framework.toLowerCase().includes(framework.toLowerCase())) return false;
       return true;
     });
-  }, [vendor, risk, framework]);
+  }, [vendor, risk, framework, historyData]);
 
   return (
     <>

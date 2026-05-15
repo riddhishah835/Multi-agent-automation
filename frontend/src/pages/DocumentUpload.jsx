@@ -4,6 +4,7 @@ import PageHeader from '../components/common/PageHeader';
 import { useToast } from '../context/ToastContext';
 import { useUploads } from '../context/UploadContext';
 import { documentTypes } from '../data/mockData';
+import { startAudit } from '../api/client';
 
 function statusLabel(s) {
   if (s === 'complete') return 'Complete';
@@ -25,6 +26,15 @@ export default function DocumentUpload() {
     const result = await uploadFiles(fileList);
     if (result.ok) {
       addToast('Files uploaded and stored successfully', 'success');
+      try {
+        const auditRes = await startAudit(fileList[0]);
+        if (auditRes?.audit_id) {
+          localStorage.setItem('current_audit_id', auditRes.audit_id);
+          addToast(`Audit started: ${auditRes.audit_id}`, 'success');
+        }
+      } catch (err) {
+        addToast('Backend disconnected - using demo mode', 'error');
+      }
     } else if (result.error) {
       addToast(result.error, 'error');
     }

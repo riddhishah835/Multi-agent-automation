@@ -22,7 +22,7 @@ export default function TopNav({ onMenuClick }) {
         </span>
       </button>
       <section className="brand">
-        <span className="brand__title">Vendor Compliance OS</span>
+        <span className="brand__title">Pramana</span>
         <span className="brand__tag">Tenant: {user?.tenantId || '—'}</span>
       </section>
 

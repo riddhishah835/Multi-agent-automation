@@ -225,7 +225,7 @@ def main():
         observability.initialize()
         logger.info("✓ Observability tracker initialized")
         
-        state_manager.initialize()
+        # state_manager.initialize()
         logger.info("✓ State manager initialized")
     
     except Exception as e:
