@@ -1,14 +1,14 @@
 # Core Framework & API
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
+fastapi==0.110.0
+uvicorn==0.27.0
+pydantic==2.6.1
 pydantic-settings==2.1.0
 
-# LLM & Agents
-langchain==0.1.0
-langchain-core==0.1.0
-langchain-openai==0.0.11
-langgraph==0.0.51
+# LLM & Agents - UPDATED FOR COMPATIBILITY
+langchain>=0.2.0
+langchain-core>=0.3.36
+langchain-openai>=0.1.1
+langgraph>=0.2.0
 langchain-mcp-adapters==0.1.0
 
 # Database & Caching
@@ -18,20 +18,20 @@ psycopg2-binary==2.9.9
 
 # Vector & Semantic Search
 faiss-cpu==1.7.4
-qdrant-client==2.7.0
+qdrant-client==1.18.0
 sentence-transformers==2.2.2
-numpy==1.24.3
+numpy>=1.24.3
 
 # Async & Concurrency
 celery==5.3.4
-asyncio-contextmanager==1.0.0
+asyncio-contextmanager==1.0.1
 tenacity==8.2.3
 
 # Security & Auth
 python-jose==3.3.0
 python-multipart==0.0.6
-pydantic[email]==2.5.0
-PyJWT==2.8.1
+pydantic[email]==2.6.1
+PyJWT==2.8.0
 
 # Monitoring & Logging
 python-json-logger==2.0.7
