@@ -84,7 +84,7 @@ class StateManager:
             
             # Also cache in memory for fast access
             cache_key = f"{run_id}:{node_id}"
-            self.state_cache[cache_key] = checkpoint
+            #self.state_cache[cache_key] = checkpoint
             
             logger.info(f"Checkpoint saved: {run_id} at node {node_id}")
             return run_id
@@ -107,10 +107,10 @@ class StateManager:
         """
         try:
             # Try cache first
-            cache_key = f"{run_id}:{node_id}" if node_id else run_id
-            if cache_key in self.state_cache:
-                logger.debug(f"Checkpoint loaded from cache: {run_id}")
-                return self.state_cache[cache_key]
+            # cache_key = f"{run_id}:{node_id}" if node_id else run_id
+            # if cache_key in self.state_cache:
+            #     logger.debug(f"Checkpoint loaded from cache: {run_id}")
+            #     return self.state_cache[cache_key]
             
             # Load from file
             if node_id:
@@ -128,7 +128,7 @@ class StateManager:
                     checkpoint = json.load(f)
                 
                 # Cache it
-                self.state_cache[cache_key] = checkpoint
+                #self.state_cache[cache_key] = checkpoint
                 logger.info(f"Checkpoint loaded: {checkpoint_file}")
                 return checkpoint
             

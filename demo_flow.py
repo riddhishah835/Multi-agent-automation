@@ -30,6 +30,7 @@ class Colors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+    GRAY = '\033[90m'
 
 
 def print_section(title: str):
@@ -115,7 +116,7 @@ async def submit_task(task_description: str) -> Dict[str, Any]:
             print(f"\nTask Details:")
             print(f"  {Colors.BOLD}Run ID:{Colors.ENDC} {result['run_id']}")
             print(f"  {Colors.BOLD}Status:{Colors.ENDC} {result['status']}")
-            print(f"  {Colors.BOLD}Created:{Colors.ENDC} {result['created_at']}")
+            #print(f"  {Colors.BOLD}Created:{Colors.ENDC} {result['created_at']}")
             return result
         else:
             print_status(f"Task submission failed: {response.status_code}", "ERROR")

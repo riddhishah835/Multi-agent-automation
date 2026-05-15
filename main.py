@@ -219,7 +219,7 @@ def main():
     # Step 5: Initialize services
     logger.info("Step 5: Initializing services...")
     try:
-        config_loader.load_all_configs()
+        #config_loader.load_all_configs()
         logger.info("✓ Config loader initialized")
         
         observability.initialize()
