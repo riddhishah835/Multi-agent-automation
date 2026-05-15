@@ -1,12 +1,20 @@
 """
-State Manager
-Handles: State checkpointing, workflow resumption, HITL coordination
+State Manager — checkpoint store, HITL flagging, and resume logic.
 
-Note: This is a placeholder for Person 3's implementation.
-Person 3 will implement the full memory layer with Redis/FAISS integration.
+Storage backends (in priority order)
+--------------------------------------
+1. Redis   — if REDIS_HOST is set and reachable
+2. Python dict — in-process fallback (ephemeral; fine for dev)
+
+Task lifecycle states
+----------------------
+  pending → running → hitl_paused → approved | rejected → completed | failed
+
+Every transition is validated against the allowed graph below.
 """
 
-import logging
+from __future__ import annotations
+
 import json
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -389,16 +397,9 @@ if __name__ == "__main__":
         "current_plan": ["validate_refund", "process_payment", "send_confirmation"],
         "gathered_context": "Customer order found, valid refund reason"
     }
-    
-    # Save checkpoint
-    checkpoint_id = state_manager.save_checkpoint(
-        run_id=run_id,
-        node_id="execution_agent",
-        state=state,
-        status="paused"
-    )
-    print(f"Checkpoint saved: {checkpoint_id}")
-    
-    # Load checkpoint
-    loaded = state_manager.load_checkpoint(run_id)
-    print(f"Loaded checkpoint: {json.dumps(loaded, indent=2, default=str)}")
+    """
+    return {
+        "task":       get_task(task_id),
+        "checkpoint": latest_checkpoint(task_id),
+        "hitl":       get_hitl_record(task_id),
+    }
