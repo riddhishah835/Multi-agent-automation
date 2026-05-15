@@ -1,45 +1,53 @@
-import { Bell, Moon, Search, Sun, User } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Bell, LogOut, Moon, Search, Shield, Sun, User } from 'lucide-react';
+import GlobalSearch from '../common/GlobalSearch';
+import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { tenants } from '../../data/mockData';
 
 export default function TopNav({ onMenuClick }) {
   const { theme, toggleTheme } = useTheme();
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    logout();
+    navigate('/login', { replace: true });
+  };
 
   return (
     <header className="top-nav">
       <button type="button" className="icon-btn" onClick={onMenuClick} aria-label="Menu">
-        <span className="brand__logo">A</span>
+        <span className="brand__logo">
+          <Shield size={16} />
+        </span>
       </button>
-      <div className="brand">
-        <span>Advanced AI Agentic OS</span>
-      </div>
+      <section className="brand">
+        <span className="brand__title">Vendor Compliance OS</span>
+        <span className="brand__tag">Tenant: {user?.tenantId || '—'}</span>
+      </section>
 
-      <label className="top-nav__search">
-        <Search size={16} />
-        <input type="search" placeholder="Search workflows, agents, traces…" />
-      </label>
+      <GlobalSearch />
 
-      <div className="top-nav__actions">
-        <select className="select-pill" defaultValue={tenants[0]} aria-label="Tenant router">
-          {tenants.map((t) => (
-            <option key={t} value={t}>
-              Tenant: {t}
-            </option>
-          ))}
-        </select>
-        <button type="button" className="icon-btn" aria-label="Search">
-          <Search size={18} />
-        </button>
-        <button type="button" className="icon-btn icon-btn--badge" aria-label="Notifications">
+      <section className="top-nav__actions">
+        <section className="user-menu">
+          <span className="icon-btn" aria-hidden>
+            <User size={18} />
+          </span>
+          <span className="user-menu__info">
+            <span className="user-menu__name">{user?.name}</span>
+            <span className="user-menu__role">{user?.role}</span>
+          </span>
+        </section>
+        <button type="button" className="icon-btn icon-btn--badge" aria-label="Alerts">
           <Bell size={18} />
         </button>
         <button type="button" className="icon-btn" onClick={toggleTheme} aria-label="Toggle theme">
           {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
         </button>
-        <button type="button" className="icon-btn" aria-label="Profile">
-          <User size={18} />
+        <button type="button" className="icon-btn" onClick={handleLogout} aria-label="Sign out" title="Sign out">
+          <LogOut size={18} />
         </button>
-      </div>
+      </section>
     </header>
   );
 }

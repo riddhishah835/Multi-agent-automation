@@ -1,143 +1,64 @@
-import { useState } from 'react';
-import { AlertTriangle, ArrowLeft, Bug } from 'lucide-react';
-import { traceRun } from '../data/mockData';
-import { useToast } from '../context/ToastContext';
-import ExecutionFlow from '../components/observability/ExecutionFlow';
-import JsonEditor from '../components/common/JsonEditor';
+import PageHeader from '../components/common/PageHeader';
 import Sparkline from '../components/common/Sparkline';
+import { systemHealth } from '../data/mockData';
 
 export default function Observability() {
-  const { addToast } = useToast();
-  const [activeEvent, setActiveEvent] = useState(3);
-  const [tab, setTab] = useState('events');
-  const [filter, setFilter] = useState('all');
-  const trace = traceRun;
-
-  const filteredEvents = trace.events.filter((e) => {
-    if (filter === 'errors') return e.label.toLowerCase().includes('pause');
-    if (filter === 'success') return !e.label.toLowerCase().includes('pause');
-    return true;
-  });
+  const h = systemHealth;
 
   return (
     <>
-      <header className="page-header">
-        <h1>Execution Trace</h1>
-        <section style={{ display: 'flex', gap: '0.5rem' }}>
-          <button type="button" className="btn btn--ghost">Trace</button>
-          <button type="button" className="btn btn--ghost">
-            <ArrowLeft size={14} /> Back
-          </button>
-          <button type="button" className="btn btn--primary" onClick={() => addToast('Debug log streaming…', 'info')}>
-            <Bug size={14} /> Debug log
-          </button>
-        </section>
-      </header>
+      <PageHeader
+        title="System Health"
+        subtitle="Agent latency, failures, token usage, and cache performance"
+      />
 
-      <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
-        ← {trace.name}, ID: {trace.id}
-        <input
-          type="search"
-          placeholder="Find workflow"
-          style={{
-            marginLeft: '1rem',
-            padding: '0.35rem 0.75rem',
-            borderRadius: 999,
-            border: '1px solid var(--border)',
-            background: 'var(--bg-card)',
-          }}
-        />
-      </p>
-
-      <section className="obs-grid">
-        <article className="card obs-graph">
-          <ExecutionFlow />
+      <section className="kpi-grid kpi-grid--health">
+        <article className="kpi-card">
+          <span className="kpi-card__value">{h.readerLatencySec}s</span>
+          <span className="kpi-card__label">Reader latency</span>
         </article>
-
-        <aside className="obs-side">
-          <article className="card">
-            <section className="tabs">
-              <button
-                type="button"
-                className={`tab${tab === 'events' ? ' tab--active' : ''}`}
-                onClick={() => setTab('events')}
-              >
-                Event log
-              </button>
-              <button
-                type="button"
-                className={`tab${tab === 'state' ? ' tab--active' : ''}`}
-                onClick={() => setTab('state')}
-              >
-                State
-              </button>
-            </section>
-            {tab === 'events' && (
-              <>
-                <select
-                  className="select-pill"
-                  style={{ marginBottom: '0.5rem', width: '100%' }}
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                >
-                  <option value="all">All events</option>
-                  <option value="errors">Warnings / pauses</option>
-                  <option value="success">Success</option>
-                </select>
-                <ul className="event-log">
-                  {filteredEvents.map((ev) => (
-                    <li
-                      key={ev.id}
-                      className={activeEvent === ev.id ? 'event-log__item--active' : ''}
-                      onClick={() => setActiveEvent(ev.id)}
-                    >
-                      [{ev.time}] {ev.label}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {tab === 'state' && (
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                Checkpoint state: waiting on policy_checker HITL gate.
-              </p>
-            )}
-          </article>
-
-          <article className="card">
-            <p className="card__title">Strict JSON Schema Contracts</p>
-            <JsonEditor value={trace.schema} readOnly />
-          </article>
-        </aside>
+        <article className="kpi-card">
+          <span className="kpi-card__value">{h.judgeLatencySec}s</span>
+          <span className="kpi-card__label">Judge latency</span>
+        </article>
+        <article className="kpi-card kpi-card--accent">
+          <span className="kpi-card__value">{h.qdrantHitRate}%</span>
+          <span className="kpi-card__label">Qdrant hit rate</span>
+        </article>
+        <article className="kpi-card">
+          <span className="kpi-card__value">{h.cacheHitRate}%</span>
+          <span className="kpi-card__label">Cache hit rate</span>
+        </article>
+        <article className="kpi-card kpi-card--danger">
+          <span className="kpi-card__value">{h.failedRuns24h}</span>
+          <span className="kpi-card__label">Failed runs (24h)</span>
+        </article>
+        <article className="kpi-card">
+          <span className="kpi-card__value">{h.tokenUsage24h}</span>
+          <span className="kpi-card__label">Token usage (24h)</span>
+        </article>
       </section>
 
-      <section className="obs-bottom" style={{ marginTop: '1rem' }}>
+      <section className="dashboard-split">
         <article className="card">
-          <header style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-            <p className="card__title" style={{ margin: 0 }}>
-              Layer 6: 3-Tier Memory &amp; Governance Checkpoints
-            </p>
-            <button type="button" className="btn btn--ghost">Schedule runs</button>
-          </header>
-          <table className="checkpoint-table">
+          <h2 className="card__title">Agent performance</h2>
+          <table className="data-table">
             <thead>
               <tr>
-                <th>Check</th>
-                <th>Time series</th>
-                <th>Hit</th>
+                <th>Agent</th>
+                <th>Latency</th>
+                <th>Runs (24h)</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
-              {trace.checkpoints.map((row) => (
-                <tr key={row.check}>
-                  <td>{row.check}</td>
+              {h.agentRuns.map((a) => (
+                <tr key={a.agent}>
+                  <td><strong>{a.agent}</strong></td>
+                  <td>{a.latency}</td>
+                  <td>{a.runs}</td>
                   <td>
-                    <Sparkline data={row.series} />
-                  </td>
-                  <td>{row.hit}</td>
-                  <td style={{ color: row.status === 'miss' ? 'var(--danger)' : 'var(--success)' }}>
-                    {row.status === 'miss' ? 'Miss' : 'Hit'}
+                    <span className={`health-dot health-dot--${a.status}`}>{a.status}</span>
                   </td>
                 </tr>
               ))}
@@ -145,12 +66,22 @@ export default function Observability() {
           </table>
         </article>
 
-        <article className="alert-box">
-          <AlertTriangle color="var(--warning)" size={22} />
-          <section>
-            <strong style={{ display: 'block', marginBottom: '0.35rem' }}>Alert status</strong>
-            <p>{trace.alert}</p>
-          </section>
+        <article className="card">
+          <h2 className="card__title">API &amp; infrastructure</h2>
+          <ul className="health-list">
+            <li>
+              <span>API failures (24h)</span>
+              <strong className="text-danger">{h.apiFailures24h}</strong>
+            </li>
+            <li>
+              <span>Gap analysis latency</span>
+              <strong>{h.gapAnalysisLatencySec}s</strong>
+            </li>
+            <li>
+              <span>Vector retrieval trend</span>
+              <Sparkline data={[65, 70, 68, 73, 71, 74, h.qdrantHitRate]} />
+            </li>
+          </ul>
         </article>
       </section>
     </>

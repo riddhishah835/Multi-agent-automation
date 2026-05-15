@@ -19,11 +19,21 @@
 
 .brand {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
+  flex-direction: column;
+  gap: 0.1rem;
+  white-space: nowrap;
+}
+
+.brand__title {
   font-weight: 600;
   font-size: 0.95rem;
-  white-space: nowrap;
+}
+
+.brand__tag {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .brand__logo {
@@ -121,6 +131,13 @@
   gap: 0.25rem;
   transition: width 0.2s ease;
   flex-shrink: 0;
+  min-height: 0;
+}
+
+.sidebar__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .sidebar--collapsed {
@@ -155,8 +172,27 @@
   border: 1px solid rgba(0, 242, 255, 0.2);
 }
 
-.sidebar--collapsed .nav-item span {
+.sidebar--collapsed .nav-item span,
+.sidebar--collapsed .sidebar__section-label {
   display: none;
+}
+
+.sidebar__section-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 0.75rem 0.85rem 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.sidebar__section-label--admin {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
 }
 
 .main-content {
