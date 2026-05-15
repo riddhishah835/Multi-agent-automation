@@ -1,10 +1,30 @@
 import uuid
-from src.planner import plan_task
-from src.executor import execute_plan
-from src.memory.vector_store import store_memory, search_memory
-from src.memory.state import save_checkpoint
-from src.api.observability import log_event
+from typing import TypedDict, Optional
+# from src.planner import plan_task
+# from src.executor import execute_plan
+# from src.memory.vector_store import store_memory, search_memory
+# from src.memory.state import save_checkpoint
+# from src.api.observability import log_event
 
+class AuditState(TypedDict):
+    run_id: str
+    tenant_id: str
+
+    uploaded_files: list[str]
+
+    parsed_documents: dict
+    retrieved_rules: dict
+
+    audit_findings: dict
+    gap_analysis: dict
+
+    draft_report: str
+
+    status: str
+    current_node: str
+
+    requires_human_review: bool
+    human_decision: Optional[str]
 
 async def execute(run_id: str, payload: dict):
     task = payload.get("task")
@@ -98,3 +118,184 @@ async def node_rule_retrieval(state: AuditState) -> AuditState:
     }
 
     return state
+
+async def node_adversarial_audit(state: AuditState) -> AuditState:
+    """
+    Simulates adversarial compliance auditing.
+    Looks for reasons to reject compliance.
+    """
+
+    state["current_node"] = "adversarial_audit"
+
+    findings = []
+
+    controls = state["parsed_documents"].get("controls_found", [])
+
+    if "Encryption at Rest" not in controls:
+        findings.append({
+            "severity": "HIGH",
+            "issue": "Missing encryption at rest",
+            "status": "non_compliant"
+        })
+
+    if "MFA Enabled" not in controls:
+        findings.append({
+            "severity": "MEDIUM",
+            "issue": "MFA not enabled",
+            "status": "non_compliant"
+        })
+
+    state["audit_findings"] = findings
+
+    return state
+
+async def node_gap_analysis(state: AuditState) -> AuditState:
+    """
+    Converts raw audit findings into
+    structured mitigation guidance.
+    """
+
+    state["current_node"] = "gap_analysis"
+
+    gaps = []
+
+    for finding in state["audit_findings"]:
+        gaps.append({
+            "risk": finding["issue"],
+            "severity": finding["severity"],
+            "recommended_fix": "Review and remediate compliance control"
+        })
+
+    state["gap_analysis"] = gaps
+
+    return state
+
+async def node_report_generation(state: AuditState) -> AuditState:
+    """
+    Generates a draft markdown audit report.
+    """
+
+    state["current_node"] = "report_generation"
+
+    findings = state["audit_findings"]
+    gaps = state["gap_analysis"]
+
+    report = f"""
+# Compliance Audit Report
+
+## Vendor
+{state["parsed_documents"].get("vendor_name")}
+
+## Document Type
+{state["parsed_documents"].get("document_type")}
+
+## Findings
+Total Findings: {len(findings)}
+
+## Gap Analysis
+Total Gaps: {len(gaps)}
+
+## Status
+Audit completed successfully.
+"""
+
+    state["draft_report"] = report
+
+    return state
+
+async def node_human_review_gate(state: AuditState) -> AuditState:
+    """
+    Simulates a Human-in-the-Loop pause gate.
+    """
+
+    state["current_node"] = "human_review_gate"
+
+    state["status"] = "awaiting_human_review"
+
+    state["requires_human_review"] = True
+
+    return state
+
+async def resume_after_human_review(
+    state: AuditState,
+    approved: bool
+) -> AuditState:
+    """
+    Simulates human approval/rejection.
+    """
+
+    state["human_decision"] = "approved" if approved else "rejected"
+
+    state["requires_human_review"] = False
+
+    if approved:
+        state["status"] = "completed"
+    else:
+        state["status"] = "rejected"
+
+    return state
+
+async def run_audit(state: AuditState) -> AuditState:
+    """
+    Main audit workflow runner.
+    Executes nodes sequentially.
+    """
+
+    state = await node_ingestion(state)
+
+    state = await node_rule_retrieval(state)
+    state = await node_adversarial_audit(state)
+    state = await node_gap_analysis(state)
+    state = await node_report_generation(state)
+    state = await node_human_review_gate(state)
+
+    return state
+
+def print_workflow_summary(state: AuditState):
+    """
+    Prints a readable workflow summary.
+    """
+
+    print("\n=== WORKFLOW SUMMARY ===\n")
+
+    print(f"Run ID: {state['run_id']}")
+    print(f"Tenant: {state['tenant_id']}")
+    print(f"Status: {state['status']}")
+    print(f"Current Node: {state['current_node']}")
+    print(f"Human Decision: {state['human_decision']}")
+
+    print("\n=== REPORT ===\n")
+
+    print(state["draft_report"])
+
+if __name__ == "__main__":
+    import asyncio
+
+    initial_state: AuditState = {
+        "run_id": "audit-001",
+        "tenant_id": "acme",
+
+        "uploaded_files": ["sample_soc2.pdf"],
+
+        "parsed_documents": {},
+        "retrieved_rules": {},
+
+        "audit_findings": {},
+        "gap_analysis": {},
+
+        "draft_report": "",
+
+        "status": "initialized",
+        "current_node": "start",
+
+        "requires_human_review": False,
+        "human_decision": None
+    }
+
+    final_state = asyncio.run(run_audit(initial_state))
+    final_state = asyncio.run(
+        resume_after_human_review(final_state, approved=True)
+    )
+
+    print("\n=== FINAL AUDIT STATE ===\n")
+    print_workflow_summary(final_state)
