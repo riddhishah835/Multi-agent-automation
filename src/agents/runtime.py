@@ -542,7 +542,6 @@ Style rules:
 - Output ONLY the Markdown report. No JSON, no preamble.
 """.strip()
 
-
 def compliance_reasoning_agent(
     task: str,
     tenant_id: str,
@@ -550,19 +549,6 @@ def compliance_reasoning_agent(
 ) -> AgentResult:
     """
     LLM-powered compliance agent. Goes beyond keyword matching.
-
-    - Reads documents with true language understanding
-    - Detects contradictions in vendor claims
-    - Extracts exact evidence sentences per control
-    - Generates a human-readable risk narrative
-
-    HIGH RISK: produces approval/rejection decisions → always requires HITL.
-
-    context keys expected:
-      document_text: str    — the raw document content
-      standard: str         — "SOC2", "ISO27001", "GDPR", "AML", "KYC"
-      vendor_name: str      — vendor display name
-      controls: list[str]   — specific controls to check evidence for
     """
     document_text = context.get("document_text", "No document provided.")
     standard      = context.get("standard", "SOC2")
@@ -604,6 +590,9 @@ def compliance_reasoning_agent(
         )
 
     except Exception as e:
+        print(f"compliance_reasoning_agent error: {e}")
+        import traceback
+        traceback.print_exc()
         return AgentResult(
             agent_name="compliance_reasoning",
             status="failed",

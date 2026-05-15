@@ -13,8 +13,9 @@ These are the canonical data contracts between:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
+from typing import Literal, Optional, List, Dict, Any
 
 
 # ── Tool schema (also used by registry.py) ────────────────────────────────────
