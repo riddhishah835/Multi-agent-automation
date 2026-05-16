@@ -18,8 +18,28 @@ const statCards = [
   { key: 'highRiskVendors', label: 'High-Risk Vendors', icon: AlertTriangle, danger: true },
 ];
 
+import { useState, useEffect } from 'react';
+import { getHistory } from '../api/client';
+
 export default function AuditQueue() {
   const stats = auditQueueStats;
+  const [recentData, setRecentData] = useState(recentAudits);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      try {
+        const data = await getHistory();
+        if (data && data.length > 0) {
+          setRecentData(data.slice(0, 5));
+        }
+      } catch (err) {
+        console.error('Error fetching history:', err);
+      }
+    };
+    fetchHistory();
+    const interval = setInterval(fetchHistory, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <>
@@ -96,7 +116,7 @@ export default function AuditQueue() {
               </tr>
             </thead>
             <tbody>
-              {recentAudits.map((a) => (
+              {recentData.map((a) => (
                 <tr key={a.id}>
                   <td><code className="code-id">{a.id}</code></td>
                   <td>{a.vendor}</td>

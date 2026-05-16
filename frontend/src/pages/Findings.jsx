@@ -1,13 +1,48 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import PageHeader from '../components/common/PageHeader';
 import SeverityBadge from '../components/common/SeverityBadge';
 import RiskScorePanel from '../components/common/RiskScorePanel';
-import { findings, riskScore } from '../data/mockData';
+import { getAuditState } from '../api/client';
+import { useToast } from '../context/ToastContext';
 
 export default function Findings() {
+  const { addToast } = useToast();
   const [filter, setFilter] = useState('all');
+  const [realTimeState, setRealTimeState] = useState(null);
 
-  const rows = findings.filter((f) => filter === 'all' || f.severity === filter);
+  useEffect(() => {
+    const auditId = localStorage.getItem('current_audit_id');
+    let errorToastShown = false;
+
+    if (!auditId) return;
+
+    const fetchState = async () => {
+      try {
+        const state = await getAuditState(auditId);
+        if (state) setRealTimeState(state);
+      } catch (err) {
+        if (!errorToastShown) {
+          addToast('Backend disconnected - using demo mode', 'error');
+          errorToastShown = true;
+        }
+      }
+    };
+
+    fetchState();
+    const interval = setInterval(fetchState, 2000);
+    return () => clearInterval(interval);
+  }, [addToast]);
+
+  const currentFindings = realTimeState?.findings || [];
+  const currentRiskScore = realTimeState?.risk_score !== undefined 
+    ? { 
+        overall: realTimeState.risk_score, 
+        compliance: Math.max(0, 100 - realTimeState.risk_score), 
+        recommendation: realTimeState.risk_score > 70 ? 'Reject (High Risk)' : 'Approve (Low Risk)'
+      } 
+    : { overall: 0, compliance: 100, recommendation: 'Pending' };
+
+  const rows = currentFindings.filter((f) => filter === 'all' || f.severity === filter);
 
   return (
     <>
@@ -51,7 +86,7 @@ export default function Findings() {
         </article>
 
         <aside>
-          <RiskScorePanel data={riskScore} />
+          <RiskScorePanel data={currentRiskScore} />
         </aside>
       </section>
     </>

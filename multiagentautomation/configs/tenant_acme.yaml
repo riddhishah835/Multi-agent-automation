@@ -1,0 +1,36 @@
+tenant_id: acme
+
+compliance_frameworks:
+  - SOC2
+  - ISO27001
+
+required_controls:
+  encryption:
+    required: true
+    severity: HIGH
+    keywords:
+      - encryption
+      - AES
+      - TLS
+      - SSL
+    description: Encryption controls must exist
+
+  mfa:
+    required: true
+    severity: MEDIUM
+    keywords:
+      - mfa
+      - multi-factor
+      - otp
+      - authenticator
+    description: MFA controls must exist
+
+  audit_logging:
+    required: true
+    severity: LOW
+    keywords:
+      - audit log
+      - logging
+      - monitoring
+      - SIEM
+    description: Audit logging controls required

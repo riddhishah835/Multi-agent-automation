@@ -1,7 +1,8 @@
+import { useState, useEffect } from 'react';
 import { Download, FileJson, FileSpreadsheet, FileText } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
+import { getAuditState } from '../api/client';
 import { useToast } from '../context/ToastContext';
-import { currentAudit, riskScore } from '../data/mockData';
 
 const formats = [
   { id: 'pdf', label: 'PDF Report', desc: 'Executive summary + findings', icon: FileText },
@@ -12,9 +13,84 @@ const formats = [
 
 export default function Reports() {
   const { addToast } = useToast();
+  const [realTimeState, setRealTimeState] = useState(null);
+
+  useEffect(() => {
+    const auditId = localStorage.getItem('current_audit_id');
+    if (!auditId) return;
+
+    const fetchState = async () => {
+      try {
+        const state = await getAuditState(auditId);
+        if (state) setRealTimeState(state);
+      } catch (err) {
+        // Silently handle
+      }
+    };
+
+    fetchState();
+    const interval = setInterval(fetchState, 2000);
+    return () => clearInterval(interval);
+  }, []);
 
   const download = (fmt) => {
-    addToast(`Downloading ${fmt.toUpperCase()} for ${currentAudit.id}`, 'success');
+    if (!realTimeState) {
+      addToast('No audit data available to download', 'error');
+      return;
+    }
+
+    let content = '';
+    let mime = 'text/plain';
+    let ext = fmt;
+
+    if (fmt === 'md') {
+      content = realTimeState.draft_report || '# No report available';
+      mime = 'text/markdown';
+    } else if (fmt === 'json') {
+      content = JSON.stringify(realTimeState, null, 2);
+      mime = 'application/json';
+    } else if (fmt === 'csv') {
+      const findings = realTimeState.findings || [];
+      content = 'Finding ID,Severity,Category,Framework\n' + 
+        findings.map(f => `"${f.finding_id}","${f.severity}","${f.issue}","${f.frameworks?.join(', ')}"`).join('\n');
+      mime = 'text/csv';
+    } else if (fmt === 'pdf') {
+      import('jspdf').then(({ jsPDF }) => {
+        const doc = new jsPDF();
+        const reportText = realTimeState.draft_report || 'No report available';
+        const lines = doc.splitTextToSize(reportText, 180);
+        doc.text(lines, 10, 10);
+        doc.save(`audit-report-${localStorage.getItem('current_audit_id')}.pdf`);
+        addToast('Downloaded PDF successfully', 'success');
+      }).catch(err => {
+        console.error('Failed to load jspdf:', err);
+        addToast('Failed to generate PDF', 'error');
+      });
+      return;
+    }
+
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `audit-report-${localStorage.getItem('current_audit_id')}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    addToast(`Downloaded ${fmt.toUpperCase()} successfully`, 'success');
+  };
+
+  const currentAudit = {
+    id: localStorage.getItem('current_audit_id') || 'Unknown',
+    vendor: realTimeState?.vendor_name || 'Unknown Vendor',
+    frameworks: ['SOC2'] // We can't pull frameworks from root easily, so we hardcode or pull from first finding
+  };
+
+  const riskScore = {
+    overall: realTimeState?.risk_score || 0,
+    recommendation: realTimeState?.risk_score > 70 ? 'Reject (High Risk)' : 'Approve (Low Risk)'
   };
 
   return (
